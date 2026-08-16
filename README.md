@@ -33,6 +33,7 @@ variant playlists and media segments.
 | `GET /resolve/tv/{imdb_id}/{s}/{e}` | Resolve TV episode HLS sources |
 | `GET /hls/{token}` | HLS master/variant playlists (URL-rewritten) + media segments (streamed, Range supported) |
 | `GET /download/{token}?filename=…` | Assemble a resolved stream into one MPEG-TS file (best variant, attachment download) |
+| `GET /file/{token}?filename=…` | Relay a resolved direct media file (Tamil MP4/MKV) as a resumable attachment download |
 | `GET /api/english/…` | English catalogue + details + embed servers (Cinemeta metadata) and Torrentio |
 | `GET /api/years`, `/api/movies`, `/api/details`, `/api/files`, `/api/stream`, `/api/auto-stream`, `/api/search` | Tamil catalogue via the Moviesda scraper |
 

@@ -237,9 +237,16 @@ def _is_encrypted(text: str) -> bool:
     return False
 
 
-def _safe_filename(name: str) -> str:
+def _safe_filename(name: str, ext: str = ".ts") -> str:
     name = re.sub(r"[^A-Za-z0-9._() -]+", "_", name).strip(" ._")
-    return (name[:120] or "freakymustard") + ".ts"
+    return (name[:120] or "freakymustard") + ext
+
+
+def _file_download_url(upstream: str, filename: str, request: Request) -> str:
+    """Signed single-file download link (Tamil direct MP4/MKV relay)."""
+    base = _public_base(request)
+    token = sign_url(upstream, ttl=HLS_TOKEN_TTL)
+    return f"{base}/file/{token}?filename={quote(filename or 'video')}"
 
 
 # --- serialization ----------------------------------------------------------
@@ -646,6 +653,62 @@ async def download(token: str, request: Request, filename: str = "video"):
     )
 
 
+@app.get("/file/{token}")
+async def file_relay(token: str, request: Request, filename: str = "video"):
+    """Stream a resolved direct media file (Tamil MP4/MKV) as an attachment.
+
+    Same signed-token contract as /hls, applied to single-file streams: the
+    token embeds the exact upstream url (so no open proxy), bytes are relayed
+    with bare headers (the CDN WAF 403s Origin/Referer), and Range requests
+    pass through so browser downloads are resumable.
+    """
+    data = verify_token(token)
+    if not data:
+        raise HTTPException(403, "invalid or expired token")
+    upstream_url = data["u"]
+
+    client = await cdn()
+    headers = dict(_CDN_HEADERS)
+    rng = request.headers.get("range")
+    if rng:
+        headers["Range"] = rng
+    try:
+        req = client.build_request("GET", upstream_url, headers=headers)
+        resp = await client.send(req, stream=True)
+    except httpx.HTTPError as exc:
+        raise HTTPException(502, f"upstream error: {exc}")
+    if resp.status_code >= 400:
+        await resp.aclose()
+        raise HTTPException(resp.status_code, f"upstream {resp.status_code}")
+
+    passthrough = {}
+    for h in ("content-length", "content-range", "accept-ranges"):
+        if h in resp.headers:
+            passthrough[h] = resp.headers[h]
+
+    ext = os.path.splitext(urlparse(upstream_url).path)[1].lower()
+    ext = ext if ext in (".mp4", ".mkv", ".webm", ".avi") else ".mp4"
+    safe = _safe_filename(filename, ext)
+    passthrough["Content-Disposition"] = (
+        f'attachment; filename="{safe}"; filename*=UTF-8\'\'{quote(safe)}'
+    )
+    passthrough["Access-Control-Allow-Origin"] = "*"
+    passthrough["Cache-Control"] = "no-store"
+
+    async def streamer():
+        try:
+            async for chunk in resp.aiter_bytes(CHUNK):
+                yield chunk
+        finally:
+            await resp.aclose()
+
+    upstream_ct = resp.headers.get("content-type", "")
+    media_type = upstream_ct if upstream_ct.startswith(("video/", "audio/")) else "video/mp4"
+    return StreamingResponse(
+        streamer(), status_code=resp.status_code, media_type=media_type, headers=passthrough
+    )
+
+
 # --- Tamil content routes (former Render backend) ----------------------------
 
 
@@ -714,7 +777,7 @@ async def get_files(quality_url: str):
 
 
 @app.get("/api/stream")
-async def get_stream_link(file_url: str):
+async def get_stream_link(file_url: str, request: Request):
     """Tamil Levels 5-7: resolve the direct media link for a file page."""
     try:
         servers = await _content_scraper.get_servers(file_url)
@@ -724,7 +787,10 @@ async def get_stream_link(file_url: str):
         final_link = await _content_scraper.resolve_final_link(servers[0]["link"], depth=0)
         if not final_link:
             raise HTTPException(status_code=404, detail="Could not resolve final link")
-        return {"stream_url": final_link}
+        return {
+            "stream_url": final_link,
+            "download_url": _file_download_url(final_link, "video", request),
+        }
     except HTTPException:
         raise
     except Exception as e:
@@ -732,7 +798,7 @@ async def get_stream_link(file_url: str):
 
 
 @app.get("/api/auto-stream")
-async def get_auto_stream(movie_url: str):
+async def get_auto_stream(movie_url: str, request: Request):
     """Tamil: resolve the best stream for a movie in one call.
 
     Quality preference 1080p > 720p > …, then the largest file at the final
@@ -796,6 +862,9 @@ async def get_auto_stream(movie_url: str):
 
         return {
             "stream_url": final_link,
+            "download_url": _file_download_url(
+                final_link, selected_file["name"] or "video", request
+            ),
             "quality": selected_quality["name"],
             "filename": selected_file["name"],
             "server_label": target_server["server"],
