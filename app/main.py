@@ -780,16 +780,13 @@ async def get_files(quality_url: str):
 async def get_stream_link(file_url: str, request: Request):
     """Tamil Levels 5-7: resolve the direct media link for a file page."""
     try:
-        servers = await _content_scraper.get_servers(file_url)
-        if not servers:
-            raise HTTPException(status_code=404, detail="No download servers found")
-
-        final_link = await _content_scraper.resolve_final_link(servers[0]["link"], depth=0)
-        if not final_link:
-            raise HTTPException(status_code=404, detail="Could not resolve final link")
+        resolved = await _content_scraper.resolve_episode(file_url)
+        if not resolved:
+            raise HTTPException(status_code=404, detail="No working download server found")
         return {
-            "stream_url": final_link,
-            "download_url": _file_download_url(final_link, "video", request),
+            "stream_url": resolved["stream_url"],
+            "download_url": _file_download_url(resolved["stream_url"], "video", request),
+            "server_label": resolved["server_label"],
         }
     except HTTPException:
         raise
@@ -875,6 +872,53 @@ async def get_auto_stream(movie_url: str, request: Request):
         raise
     except Exception as e:
         print(f"Error in auto-stream: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/series")
+async def get_series(page: int = 1):
+    """Tamil web series listing (paginated)."""
+    try:
+        results = await _content_scraper.get_series_list(page)
+        return {"page": page, "results": results, "has_more": len(results) > 0}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/seasons")
+async def get_seasons(series_url: str):
+    """Seasons (and metadata) for a Tamil web series."""
+    try:
+        data = await _content_scraper.get_seasons(series_url)
+        return data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/episodes")
+async def get_episodes(season_url: str, pages: int = 10):
+    """Episodes of a season, oldest first."""
+    try:
+        return await _content_scraper.get_episodes(season_url, pages)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/episode-stream")
+async def get_episode_stream(episode_url: str, request: Request):
+    """Resolve a direct stream for one episode (tries every server)."""
+    try:
+        resolved = await _content_scraper.resolve_episode(episode_url)
+        if not resolved:
+            raise HTTPException(status_code=404, detail="Could not resolve episode stream")
+        return {
+            "stream_url": resolved["stream_url"],
+            "download_url": _file_download_url(resolved["stream_url"], "episode", request),
+            "server_label": resolved["server_label"],
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 

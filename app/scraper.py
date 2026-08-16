@@ -15,6 +15,7 @@ Levels:
   6 resolve_final_link — follows server pages to the direct .mp4/.mkv
 """
 
+import asyncio
 import httpx
 from bs4 import BeautifulSoup
 from typing import Optional, List, Dict
@@ -66,6 +67,8 @@ def canonical_page_url(url: str) -> str:
 
 
 class MoviesdaScraper:
+    SERIES_LIST_URL = "https://moviesdatamil.co/tamil-web-series-download/"
+
     def __init__(self):
         self.headers = dict(_FALLBACK_HEADERS)
         self.base_url = "https://gotopage.top/?ref=2026"  # Seed/directory URL
@@ -261,32 +264,69 @@ class MoviesdaScraper:
                   items.append({"server": text, "link": await self._resolve_url(href)})
         return items
 
-    async def resolve_final_link(self, server_url: str, depth: int = 0) -> Optional[str]:
-        """Level 6+: Recursively follow redirect/server pages to get final media link."""
-        if depth > 3:
+    async def resolve_final_link(self, server_url: str, depth: int = 0, _visited: Optional[set] = None) -> Optional[str]:
+        """Level 6+: Recursively follow redirect/server pages to get final media link.
+
+        Two terminal states:
+          - a page carrying a direct .mp4/.mkv/.m3u8 link, or
+          - a url that IS the media (e.g. uptomkv ``download.php?dl=…`` streams
+            the signed, expiring file directly — fetching it as HTML would
+            pull the whole movie into memory, so hops are streamed and
+            content-sniffed before parsing).
+
+        ``_visited`` prevents the self-referential "Download Server 2" loops
+        some mirror pages contain.
+        """
+        if depth > 6:
             print("Max depth reached in resolving link.")
             return None
+        if _visited is None:
+            _visited = set()
+        if server_url in _visited:
+            return None
+        _visited.add(server_url)
 
         try:
-            print(f"Resolving (Depth {depth}): {server_url}")
-            soup = await self._get_soup(server_url)
+            print(f"Resolving (Depth {depth}): {server_url[:110]}")
+            req = self.client.build_request("GET", server_url, headers=self.headers)
+            resp = await self.client.send(req, stream=True)
 
-            # 1. Direct download button (.mp4/.mkv) — success
+            final_url = str(resp.url)
+            parsed = urllib.parse.urlparse(final_url)
+            self.resolved_base = f"{parsed.scheme}://{parsed.netloc}"
+
+            # --- Is this hop the media itself? ---
+            ct = (resp.headers.get("content-type") or "").lower()
+            cl = resp.headers.get("content-length")
+            looks_html = "html" in ct or "xml" in ct or "json" in ct
+            huge = cl and cl.isdigit() and int(cl) > 5_000_000
+            if not looks_html or huge:
+                await resp.aclose()
+                return final_url
+
+            body = await resp.aread()
+            if len(body) > 5_000_000:  # binary served as text/html
+                return final_url
+            await resp.aclose()
+            soup = BeautifulSoup(body, "html.parser")
+
+            # 1. Direct download button (.mp4/.mkv/.m3u8) — success
             for a in soup.find_all("a"):
                 href = a.get("href", "")
-                if href.endswith(".mp4") or href.endswith(".mkv"):
+                low = href.lower()
+                if low.endswith(".mp4") or low.endswith(".mkv") or low.endswith(".m3u8"):
                     return await self._resolve_url(href)
 
             # 2. "Download Server" buttons — recurse
             for a in soup.find_all("a"):
                 text = a.get_text(strip=True)
                 href = a.get("href", "")
-                if ("download server" in text.lower() or "server" in text.lower()) and "home" not in text.lower():
-                     next_link = await self._resolve_url(href)
-                     if next_link != server_url:
-                         print(f"Following recursive link: {text} -> {next_link}")
-                         result = await self.resolve_final_link(next_link, depth + 1)
-                         if result: return result
+                if ("download server" in text.lower() or "server" in text.lower() or "watch online" in text.lower()) and "home" not in text.lower():
+                    next_link = await self._resolve_url(href)
+                    if next_link != server_url:
+                        result = await self.resolve_final_link(next_link, depth + 1, _visited)
+                        if result:
+                            return result
 
             # 3. Meta refresh fallback
             meta_refresh = soup.find("meta", attrs={"http-equiv": re.compile("refresh", re.I)})
@@ -300,3 +340,85 @@ class MoviesdaScraper:
         except Exception as e:
             print(f"Error resolving final link: {e}")
             return None
+
+    # --- Tamil web series --------------------------------------------------------
+
+    async def get_series_list(self, page: int = 1) -> List[Dict[str, any]]:
+        """Series listing page (paginated with the site's ?get-page=N param)."""
+        url = self.SERIES_LIST_URL if page <= 1 else f"{self.SERIES_LIST_URL}?get-page={page}"
+        soup = await self._get_soup(url)
+        items, seen = [], set()
+        for a in soup.find_all("a", href=True):
+            href = a.get("href", "")
+            text = a.get_text(strip=True)
+            if "web-series" not in href or not text or self._is_nav_junk(text):
+                continue
+            link = await self._resolve_url(href)
+            key = path_key(link)
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append({"title": text, "link": link})
+        return items
+
+    async def get_seasons(self, series_url: str) -> Dict[str, any]:
+        """Series page: season folders (+ poster/description metadata)."""
+        data = await self.get_qualities(canonical_page_url(series_url))
+        seasons, episodes = [], []
+        for item in data["qualities"]:
+            href = item["link"].lower()
+            if "epi-" in href or "/download/" in href:
+                episodes.append(item)  # single-season series lists episodes directly
+            elif "season" in href or "season" in item["name"].lower():
+                seasons.append(item)
+        return {"seasons": seasons, "episodes": episodes, "meta": data["meta"]}
+
+    async def get_episodes(self, season_url: str, pages: int = 10) -> List[Dict[str, any]]:
+        """Season page: episode links, aggregated over pagination.
+
+        The site lists newest-first; results are returned oldest-first with a
+        numeric ``episode`` field parsed from the /download/…-epi-N/ slug.
+        """
+        base = canonical_page_url(season_url)
+        by_key = {}
+        for page in range(1, pages + 1):
+            url = base if page == 1 else f"{base}{'&' if '?' in base else '?'}page={page}"
+            try:
+                soup = await self._get_soup(url)
+            except Exception as e:
+                print(f"Episode page {page} failed: {e}")
+                break
+            found = 0
+            for a in soup.find_all("a", href=True):
+                href = a.get("href", "")
+                text = a.get_text(strip=True)
+                if ("epi-" not in href and "/download/" not in href) or not text:
+                    continue
+                if self._is_nav_junk(text):
+                    continue
+                link = await self._resolve_url(href)
+                key = path_key(link)
+                if not key or key in by_key:
+                    continue
+                m = re.search(r"epi-(\d+)", href)
+                by_key[key] = {
+                    "title": text.replace("Moviesda.Mobi - ", "").strip(),
+                    "link": link,
+                    "episode": int(m.group(1)) if m else None,
+                }
+                found += 1
+            if found == 0:
+                break
+            await asyncio.sleep(0.2)
+        episodes = list(by_key.values())
+        episodes.sort(key=lambda e: (e["episode"] is None, e["episode"] or 0))
+        return episodes
+
+    async def resolve_episode(self, episode_url: str) -> Optional[Dict[str, str]]:
+        """Episode page -> best direct stream (tries every server in turn)."""
+        servers = await self.get_servers(canonical_page_url(episode_url))
+        for srv in servers:
+            link = await self.resolve_final_link(srv["link"], depth=0)
+            if link:
+                return {"stream_url": link, "server_label": srv["server"]}
+        return None
