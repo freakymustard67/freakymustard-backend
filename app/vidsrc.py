@@ -50,27 +50,43 @@ class StreamResult:
 
 # --- WASM decryption -------------------------------------------------------
 
+# A single shared wasmtime Engine. Modules are bound to the engine that
+# compiled them, so we must never mix engines: the provider rotates the WASM
+# decryptor every ~5 minutes, and compiling each new module with a fresh
+# engine while instantiating it against a cached one triggers
+# "cross-`Engine` instantiation is not currently supported". One shared
+# engine (wasmtime engines are cheap and meant to be reused) sidesteps that
+# entirely.
+_engine = None
 _wasm_cache: dict[str, object] = {}  # sha256(wasm bytes) -> compiled wasmtime.Module
+
+
+def _get_engine():
+    global _engine
+    if _engine is None:
+        from wasmtime import Engine
+
+        _engine = Engine()
+    return _engine
 
 
 def _decrypt_stream_urls(enc_b64: str, wasm_bytes: bytes) -> list[str]:
     """Run the provider's ChaCha20 WASM decryptor in-process via wasmtime."""
     try:
-        from wasmtime import Engine, Instance, Module, Store
+        from wasmtime import Instance, Module, Store
     except ImportError as exc:  # pragma: no cover
         raise VidSrcError("wasmtime not installed") from exc
 
     import ctypes
 
+    engine = _get_engine()
+
     key = hashlib.sha256(wasm_bytes).hexdigest()
     module = _wasm_cache.get(key)
     if module is None:
-        engine = Engine()
         module = Module(engine, wasm_bytes)
         _wasm_cache[key] = module
-        _wasm_cache.setdefault("__engine__", engine)
 
-    engine = _wasm_cache["__engine__"]
     store = Store(engine)
     instance = Instance(store, module, [])
     ex = instance.exports(store)
