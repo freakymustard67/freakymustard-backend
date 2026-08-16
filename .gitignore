@@ -1,0 +1,7 @@
+venv/
+vidlink-ref/
+vidsrc-ref/
+vidsrc.py
+__pycache__/
+*.pyc
+.env
