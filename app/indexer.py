@@ -22,6 +22,17 @@ DB_NAME = "moviesda_db"
 COLLECTION_NAME = "movies"
 
 
+def canonical_link(base: str, key: str) -> str:
+    """Rebuild a working link from a path key.
+
+    Directory-style pages on the source site 302 to a junk page unless the
+    path ends with ``/``, so keys without a query always get the slash back.
+    """
+    if "?" in key:
+        return f"{base}{key}"
+    return f"{base}{key}/"
+
+
 class MovieIndexer:
     def __init__(self):
         self.scraper = MoviesdaScraper()
@@ -61,7 +72,7 @@ class MovieIndexer:
         # right now, so lookups survive mirror migrations.
         base = self.scraper.resolved_base
         if base:
-            movie["link"] = f"{base}{key}"
+            movie["link"] = canonical_link(base, key)
 
         existing = await self.collection.find_one({"path_key": key})
         if existing:

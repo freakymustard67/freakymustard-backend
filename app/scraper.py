@@ -46,6 +46,25 @@ def path_key(link: str) -> str:
     return key
 
 
+def canonical_page_url(url: str) -> str:
+    """Normalize a site page url to the form the site actually serves.
+
+    Directory-style pages 302 to a junk ``movies.php`` unless the path ends
+    with ``/`` — a slash-less url must never reach the scraper. External
+    download-chain urls (with a query or a dotted last segment) pass through
+    untouched.
+    """
+    if not url:
+        return url
+    p = urllib.parse.urlparse(url)
+    if p.query or p.path.endswith("/"):
+        return url
+    last = p.path.rsplit("/", 1)[-1]
+    if "." in last:  # e.g. movies.php — a real file
+        return url
+    return url.rstrip("/") + "/"
+
+
 class MoviesdaScraper:
     def __init__(self):
         self.headers = dict(_FALLBACK_HEADERS)
@@ -91,7 +110,7 @@ class MoviesdaScraper:
 
     async def get_movies_in_year(self, year_url: str) -> List[Dict[str, str]]:
         """Level 2: List movies in a specific year page."""
-        soup = await self._get_soup(year_url)
+        soup = await self._get_soup(canonical_page_url(year_url))
         items = []
         for a_tag in soup.find_all("a"):
             text = a_tag.get_text(strip=True)
@@ -129,7 +148,7 @@ class MoviesdaScraper:
 
     async def get_qualities(self, movie_url: str) -> Dict[str, any]:
         """Level 3: Get available qualities (e.g. Original, 640x360) AND Metadata."""
-        soup = await self._get_soup(movie_url)
+        soup = await self._get_soup(canonical_page_url(movie_url))
 
         # --- Metadata Extraction ---
         meta = {"poster": None, "desc": None, "rating": None}
