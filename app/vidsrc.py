@@ -59,6 +59,7 @@ class StreamResult:
 # entirely.
 _engine = None
 _wasm_cache: dict[str, object] = {}  # sha256(wasm bytes) -> compiled wasmtime.Module
+_WASM_CACHE_MAX = 32  # ~2.5h of provider rotation windows; evict oldest beyond this
 
 
 def _get_engine():
@@ -86,6 +87,11 @@ def _decrypt_stream_urls(enc_b64: str, wasm_bytes: bytes) -> list[str]:
     if module is None:
         module = Module(engine, wasm_bytes)
         _wasm_cache[key] = module
+        # The provider rotates the decryptor every ~5 minutes, so this cache
+        # grows forever otherwise. Evict the oldest compiled modules (dict
+        # preserves insertion order).
+        while len(_wasm_cache) > _WASM_CACHE_MAX:
+            _wasm_cache.pop(next(iter(_wasm_cache)))
 
     store = Store(engine)
     instance = Instance(store, module, [])

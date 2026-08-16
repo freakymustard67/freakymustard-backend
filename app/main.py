@@ -1,4 +1,4 @@
-"""Streamda Proxy — ad-free stream resolution for Streamda.
+"""FreakyMustard Proxy — ad-free stream resolution for FreakyMustard.
 
 Resolves clean HLS streams from the VidSrc (vidsrcme) API and relays every
 byte through a signed, stateless HLS proxy so the browser never loads the
@@ -14,6 +14,7 @@ Why a byte proxy at all?
 Endpoints
 ---------
 GET /health
+GET /health/deep   — end-to-end chain check (resolve->token->master->variant->segment)
 GET /resolve/movie/{imdb_id}
 GET /resolve/tv/{imdb_id}/{season}/{episode}
 GET /hls/{token}   — HLS master/variant playlists (URL-rewritten) and media
@@ -228,13 +229,121 @@ async def health() -> dict:
 @app.get("/", response_class=HTMLResponse)
 async def root() -> str:
     return (
-        "<!doctype html><meta charset=utf-8><title>Streamda Proxy</title>"
+        "<!doctype html><meta charset=utf-8><title>FreakyMustard Proxy</title>"
         "<body style='background:#0a0a0c;color:#e2e8f0;font-family:monospace;"
         "display:grid;place-items:center;height:100vh;margin:0'>"
-        "<div><h1>&#127916; Streamda Proxy</h1>"
+        "<div><h1>&#127916; FreakyMustard Proxy</h1>"
         "<p>Ad-free HLS stream resolution service.</p>"
         "<p><a style='color:#3b82f6' href='/health'>/health</a></p></div>"
     )
+
+
+@app.get("/health/deep")
+async def health_deep() -> JSONResponse:
+    """End-to-end chain check: resolve -> decrypt -> token -> master -> segment.
+
+    Unlike /health (which only proves the process is up), this proves the
+    whole upstream chain still works. Intended for a watchdog cron. Kept
+    cheap: one resolve (cached), one master fetch, one ~1-byte segment probe.
+    """
+    t0 = time.monotonic()
+    report: dict = {"ok": False, "stages": {}, "ms": 0}
+
+    def stage(name: str, ok: bool, detail: str = "") -> None:
+        report["stages"][name] = {"ok": ok, "detail": detail}
+
+    try:
+        # 1. Resolve a well-known, stable title (Inception).
+        try:
+            result = await _resolve_cached("movie:tt1375666", lambda: resolve_movie("tt1375666"))
+            stage("resolve", bool(result.masters), f"{len(result.masters)} masters")
+        except Exception as exc:  # noqa: BLE001 - report, don't crash
+            stage("resolve", False, str(exc)[:200])
+            report["ms"] = int((time.monotonic() - t0) * 1000)
+            return JSONResponse(report, status_code=200)
+
+        master = _strip_token(result.masters[0])
+        parsed = urlparse(master)
+        host_origin = f"{parsed.scheme}://{parsed.netloc}"
+
+        # 2. Upstream token (IP-bound).
+        try:
+            up_token = await _upstream_token(host_origin)
+            stage("token", bool(up_token), f"{len(up_token)} chars")
+        except Exception as exc:  # noqa: BLE001
+            stage("token", False, str(exc)[:200])
+            report["ms"] = int((time.monotonic() - t0) * 1000)
+            return JSONResponse(report, status_code=200)
+
+        client = await cdn()
+
+        # 3. Master playlist.
+        try:
+            resp = await client.get(_stamp_token(master, up_token), headers=_CDN_HEADERS)
+            ok = resp.status_code == 200 and "#EXTM3U" in resp.text
+            stage("master", ok, f"http {resp.status_code}")
+            if not ok:
+                report["ms"] = int((time.monotonic() - t0) * 1000)
+                return JSONResponse(report, status_code=200)
+        except Exception as exc:  # noqa: BLE001
+            stage("master", False, str(exc)[:200])
+            report["ms"] = int((time.monotonic() - t0) * 1000)
+            return JSONResponse(report, status_code=200)
+
+        # 4. Variant playlist (master lists variant playlists, not segments).
+        variant_url = None
+        for line in resp.text.splitlines():
+            s = line.strip()
+            if s and not s.startswith("#"):
+                variant_url = urljoin(master, s)
+                break
+        if not variant_url:
+            stage("variant", False, "no variant in master")
+            report["ms"] = int((time.monotonic() - t0) * 1000)
+            return JSONResponse(report, status_code=200)
+        try:
+            var_resp = await client.get(
+                _stamp_token(_strip_token(variant_url), up_token), headers=_CDN_HEADERS
+            )
+            ok = var_resp.status_code == 200 and "#EXTM3U" in var_resp.text
+            stage("variant", ok, f"http {var_resp.status_code}")
+            if not ok:
+                report["ms"] = int((time.monotonic() - t0) * 1000)
+                return JSONResponse(report, status_code=200)
+        except Exception as exc:  # noqa: BLE001
+            stage("variant", False, str(exc)[:200])
+            report["ms"] = int((time.monotonic() - t0) * 1000)
+            return JSONResponse(report, status_code=200)
+
+        # 5. First media segment (probe 1 byte — enough to confirm access).
+        seg_url = None
+        for line in var_resp.text.splitlines():
+            s = line.strip()
+            if s and not s.startswith("#"):
+                seg_url = urljoin(variant_url, s)
+                break
+        if not seg_url:
+            stage("segment", False, "no segment in variant")
+            report["ms"] = int((time.monotonic() - t0) * 1000)
+            return JSONResponse(report, status_code=200)
+        try:
+            seg_resp = await client.get(
+                _stamp_token(_strip_token(seg_url), up_token),
+                headers={**_CDN_HEADERS, "Range": "bytes=0-0"},
+            )
+            first = seg_resp.content[:1]
+            ok = seg_resp.status_code in (200, 206) and first == b"\x47"
+            stage("segment", ok, f"http {seg_resp.status_code} first_byte={first.hex() or 'empty'}")
+        except Exception as exc:  # noqa: BLE001
+            stage("segment", False, str(exc)[:200])
+
+        report["ok"] = all(s["ok"] for s in report["stages"].values())
+        report["ms"] = int((time.monotonic() - t0) * 1000)
+        return JSONResponse(report, status_code=200)
+    except Exception as exc:  # noqa: BLE001
+        report["error"] = str(exc)[:200]
+        report["ms"] = int((time.monotonic() - t0) * 1000)
+        return JSONResponse(report, status_code=200)
 
 
 @app.get("/resolve/movie/{imdb_id}")
