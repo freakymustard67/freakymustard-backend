@@ -19,6 +19,8 @@ GET /resolve/movie/{imdb_id}
 GET /resolve/tv/{imdb_id}/{season}/{episode}
 GET /hls/{token}   — HLS master/variant playlists (URL-rewritten) and media
                      segments (streamed). Range supported for segments.
+GET /download/{token}?filename=… — assemble a resolved HLS stream into one
+                     MPEG-TS file and stream it as an attachment.
 
 Every /hls url is HMAC-signed and embeds the exact upstream url, so this
 service can never be abused as an open proxy.
@@ -30,7 +32,7 @@ import asyncio
 import os
 import re
 import time
-from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
+from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlparse, urlunparse
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -41,7 +43,7 @@ from cache import TTLCache
 from signing import sign_url, verify_token
 from vidsrc import StreamResult, VidSrcError, resolve_movie, resolve_tv, UA
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "*")
 RESOLVE_TTL = int(os.environ.get("RESOLVE_TTL", "240"))  # master-url resolve cache
 HLS_TOKEN_TTL = int(os.environ.get("HLS_TOKEN_TTL", "21600"))  # signed url validity (6h)
@@ -60,6 +62,10 @@ app.add_middleware(
 )
 
 _cache = TTLCache(default_ttl=RESOLVE_TTL, max_entries=1024)
+
+# Whole-file downloads are the heaviest thing this service does; cap how many
+# run at once so one download storm can't starve playback on a free-tier CPU.
+_DL_SEMAPHORE = asyncio.Semaphore(int(os.environ.get("DOWNLOAD_CONCURRENCY", "3")))
 
 _rl: dict[str, list[float]] = {}
 RL_LIMIT = int(os.environ.get("RL_LIMIT", "60"))
@@ -174,6 +180,44 @@ def _rewrite_playlist(text: str, base_upstream_url: str, base: str) -> str:
             resolved = _strip_token(urljoin(base_upstream_url, stripped))
             out.append(f"{base}/hls/{sign_url(resolved, ttl=HLS_TOKEN_TTL)}")
     return "\n".join(out) + "\n"
+
+
+# --- download helpers ---------------------------------------------------------
+
+
+def _variant_urls(text: str, base_url: str) -> list[tuple[int, str]]:
+    """[(bandwidth, uri)] for every #EXT-X-STREAM-INF entry in a master playlist."""
+    variants: list[tuple[int, str]] = []
+    bw = 0
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("#EXT-X-STREAM-INF"):
+            m = re.search(r"BANDWIDTH=(\d+)", s)
+            bw = int(m.group(1)) if m else 0
+        elif s and not s.startswith("#"):
+            variants.append((bw, urljoin(base_url, s)))
+            bw = 0
+    return variants
+
+
+def _segment_urls(text: str, base_url: str) -> list[str]:
+    """Absolute urls of every media segment line in a media playlist."""
+    lines = [s.strip() for s in text.splitlines()]
+    return [urljoin(base_url, s) for s in lines if s and not s.startswith("#")]
+
+
+def _is_encrypted(text: str) -> bool:
+    """True if the playlist demands EXT-X-KEY decryption we don't perform."""
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("#EXT-X-KEY") and "METHOD=NONE" not in s.upper():
+            return True
+    return False
+
+
+def _safe_filename(name: str) -> str:
+    name = re.sub(r"[^A-Za-z0-9._() -]+", "_", name).strip(" ._")
+    return (name[:120] or "freakymustard") + ".ts"
 
 
 # --- serialization ----------------------------------------------------------
@@ -475,6 +519,106 @@ async def hls_head(token: str, request: Request):
             if k.lower() in ("content-type", "content-length", "accept-ranges")
         }
         | {"Access-Control-Allow-Origin": "*"},
+    )
+
+
+@app.get("/download/{token}")
+async def download(token: str, request: Request, filename: str = "video"):
+    """Assemble a resolved HLS stream into one MPEG-TS file and stream it out.
+
+    Takes the same signed token the player uses (`/hls/{token}` pointing at a
+    master playlist), picks the highest-bandwidth variant, and concatenates
+    every media segment into a single `attachment` response. The browser then
+    downloads natively (streamed to disk) instead of holding a movie-sized
+    blob in tab memory.
+
+    Segment bytes are relayed exactly as in /hls (segments are plain TS; the
+    deep-health probe asserts the 0x47 sync byte). If the CDN's IP-bound token
+    expires mid-download (TTL 180s), it is refreshed and the segment retried.
+    """
+    data = verify_token(token)
+    if not data:
+        raise HTTPException(403, "invalid or expired token")
+    master_url = data["u"]
+    if not _is_playlist(master_url):
+        raise HTTPException(400, "token does not reference a playlist")
+
+    parsed = urlparse(master_url)
+    host_origin = f"{parsed.scheme}://{parsed.netloc}"
+    client = await cdn()
+    up_token = await _upstream_token(host_origin)
+
+    async def fetch_playlist(url: str) -> str:
+        try:
+            resp = await client.get(
+                _stamp_token(_strip_token(url), up_token), headers=_CDN_HEADERS
+            )
+        except httpx.HTTPError as exc:
+            raise HTTPException(502, f"upstream error: {exc}")
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, f"upstream {resp.status_code}")
+        return resp.text
+
+    master_text = await fetch_playlist(master_url)
+    if _is_encrypted(master_text):
+        raise HTTPException(422, "encrypted streams cannot be downloaded")
+
+    variants = _variant_urls(master_text, master_url)
+    if variants:
+        # Highest bandwidth variant = best quality.
+        variant_url = max(variants, key=lambda v: v[0])[1]
+        media_text = await fetch_playlist(variant_url)
+        if _is_encrypted(media_text):
+            raise HTTPException(422, "encrypted streams cannot be downloaded")
+    else:
+        # The "master" was already a media playlist.
+        variant_url = master_url
+        media_text = master_text
+
+    segments = _segment_urls(media_text, variant_url)
+    if not segments:
+        raise HTTPException(502, "no media segments found")
+
+    safe = _safe_filename(filename)
+    token_box = [up_token]  # mutable so the streamer can refresh it mid-flight
+
+    async def assemble():
+        # Failures before the first yield can still become proper HTTP errors;
+        # after that the client simply sees a truncated download.
+        async with _DL_SEMAPHORE:
+            for seg in segments:
+                for attempt in (0, 1):
+                    try:
+                        fetch_url = _stamp_token(_strip_token(seg), token_box[0])
+                        req = client.build_request("GET", fetch_url, headers=_CDN_HEADERS)
+                        resp = await client.send(req, stream=True)
+                        if resp.status_code == 403 and attempt == 0:
+                            # CDN token expired mid-download — refresh, retry.
+                            await resp.aclose()
+                            token_box[0] = await _upstream_token(host_origin)
+                            continue
+                        if resp.status_code >= 400:
+                            await resp.aclose()
+                            raise RuntimeError(f"segment http {resp.status_code}")
+                        async for chunk in resp.aiter_bytes(CHUNK):
+                            yield chunk
+                        await resp.aclose()
+                        break
+                    except httpx.HTTPError:
+                        if attempt:
+                            raise
+                        token_box[0] = await _upstream_token(host_origin)
+
+    return StreamingResponse(
+        assemble(),
+        media_type="video/mp2t",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="{safe}"; filename*=UTF-8\'\'{quote(safe)}'
+            ),
+            "Access-Control-Allow-Origin": "*",
+            "Cache-Control": "no-store",
+        },
     )
 
 

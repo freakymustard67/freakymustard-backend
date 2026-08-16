@@ -32,6 +32,7 @@ variant playlists and media segments.
 | `GET /resolve/movie/{imdb_id}` | Resolve movie HLS sources (IMDB id, e.g. `tt1375666`) |
 | `GET /resolve/tv/{imdb_id}/{s}/{e}` | Resolve TV episode HLS sources |
 | `GET /hls/{token}` | HLS master/variant playlists (URL-rewritten) + media segments (streamed, Range supported) |
+| `GET /download/{token}?filename=…` | Assemble a resolved stream into one MPEG-TS file (best variant, attachment download) |
 
 Every `/hls` URL is HMAC-signed and embeds the exact upstream URL, so this
 service cannot be abused as an open proxy.
