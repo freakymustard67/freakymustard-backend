@@ -1,7 +1,10 @@
 venv/
-vidlink-ref/
-vidsrc-ref/
-vidsrc.py
 __pycache__/
 *.pyc
 .env
+
+# reference clones (not part of the deployable service)
+vidlink-ref/
+vidsrc-ref/
+vidlink-proxy-ref/
+cinepro-ref/
