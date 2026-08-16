@@ -21,6 +21,9 @@ GET /hls/{token}   — HLS master/variant playlists (URL-rewritten) and media
                      segments (streamed). Range supported for segments.
 GET /download/{token}?filename=… — assemble a resolved HLS stream into one
                      MPEG-TS file and stream it as an attachment.
+GET /api/english/… — Cinemeta catalogue, details, embed servers, torrents.
+GET /api/years | /api/movies | /api/search | /api/details | /api/files |
+     /api/stream | /api/auto-stream — Tamil scraper traversal + Mongo index.
 
 Every /hls url is HMAC-signed and embeds the exact upstream url, so this
 service can never be abused as an open proxy.
@@ -42,15 +45,19 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingRes
 from cache import TTLCache
 from signing import sign_url, verify_token
 from vidsrc import StreamResult, VidSrcError, resolve_movie, resolve_tv, UA
+from english import router as english_router
+from indexer import MovieIndexer
+from scraper import MoviesdaScraper
 
-VERSION = "2.1.0"
+VERSION = "3.0.0"
 ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "*")
 RESOLVE_TTL = int(os.environ.get("RESOLVE_TTL", "240"))  # master-url resolve cache
 HLS_TOKEN_TTL = int(os.environ.get("HLS_TOKEN_TTL", "21600"))  # signed url validity (6h)
 UPSTREAM_TOKEN_TTL = int(os.environ.get("UPSTREAM_TOKEN_TTL", "180"))  # per-host token cache
 CHUNK = 256 * 1024
 
-app = FastAPI(title="Streamda Proxy", version=VERSION, docs_url=None, redoc_url=None)
+app = FastAPI(title="FreakyMustard Proxy", version=VERSION, docs_url=None, redoc_url=None)
+app.include_router(english_router)
 
 app.add_middleware(
     CORSMiddleware,
@@ -66,6 +73,11 @@ _cache = TTLCache(default_ttl=RESOLVE_TTL, max_entries=1024)
 # Whole-file downloads are the heaviest thing this service does; cap how many
 # run at once so one download storm can't starve playback on a free-tier CPU.
 _DL_SEMAPHORE = asyncio.Semaphore(int(os.environ.get("DOWNLOAD_CONCURRENCY", "3")))
+
+# --- content half (former Render backend) ------------------------------------
+
+_content_scraper = MoviesdaScraper()
+_content_indexer = MovieIndexer()
 
 _rl: dict[str, list[float]] = {}
 RL_LIMIT = int(os.environ.get("RL_LIMIT", "60"))
@@ -95,10 +107,20 @@ async def cdn() -> httpx.AsyncClient:
     return _client
 
 
+@app.on_event("startup")
+async def _startup() -> None:
+    # Content half: ensure the unique path_key index exists, then refresh the
+    # Tamil catalogue in the background (no-op without MONGO_URI). Set
+    # INDEX_ON_START=0 to disable (e.g. while debugging the streaming half).
+    if os.environ.get("INDEX_ON_START", "1") != "0":
+        asyncio.create_task(_content_indexer.start_indexing())
+
+
 @app.on_event("shutdown")
 async def _close() -> None:
     if _client and not _client.is_closed:
         await _client.aclose()
+    await _content_scraper.client.aclose()
 
 
 def _rate_limited(ip: str) -> bool:
@@ -266,6 +288,8 @@ async def health() -> dict:
         "version": VERSION,
         "providers": ["vidsrc"],
         "cache": _cache.stats(),
+        "mongo": _content_indexer.collection is not None,
+        "indexing": _content_indexer.is_indexing,
         "time": int(time.time()),
     }
 
@@ -620,6 +644,169 @@ async def download(token: str, request: Request, filename: str = "video"):
             "Cache-Control": "no-store",
         },
     )
+
+
+# --- Tamil content routes (former Render backend) ----------------------------
+
+
+@app.get("/api/search")
+async def search_movies(q: str):
+    """Search the indexed Tamil catalogue."""
+    return await _content_indexer.search(q)
+
+
+@app.get("/api/years")
+async def get_years():
+    """Tamil Level 1: year categories."""
+    try:
+        return await _content_scraper.get_years()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/movies")
+async def get_movies(year_url: str, pages: int = 3):
+    """Tamil Level 2: movies for a year category, aggregating pages."""
+    try:
+        all_movies = []
+        base_url = year_url
+        if not base_url.endswith("/"):
+            base_url += "/"
+
+        for page_num in range(1, pages + 1):
+            if page_num == 1:
+                current_url = base_url
+            else:
+                separator = "?" if base_url.endswith("/") else "/?"
+                current_url = f"{base_url}{separator}page={page_num}"
+
+            try:
+                movies = await _content_scraper.get_movies_in_year(current_url)
+                all_movies.extend(movies)
+            except Exception:
+                break  # page doesn't exist
+
+        return await _content_indexer.enrich_metadata(all_movies)
+    except Exception as e:
+        import traceback
+
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/details")
+async def get_movie_details(movie_url: str):
+    """Tamil Level 3: quality variants + metadata for a movie."""
+    try:
+        data = await _content_scraper.get_qualities(movie_url)
+        return data.get("qualities", [])
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/files")
+async def get_files(quality_url: str):
+    """Tamil Level 4: files inside a quality folder."""
+    try:
+        return await _content_scraper.get_files(quality_url)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/stream")
+async def get_stream_link(file_url: str):
+    """Tamil Levels 5-7: resolve the direct media link for a file page."""
+    try:
+        servers = await _content_scraper.get_servers(file_url)
+        if not servers:
+            raise HTTPException(status_code=404, detail="No download servers found")
+
+        final_link = await _content_scraper.resolve_final_link(servers[0]["link"], depth=0)
+        if not final_link:
+            raise HTTPException(status_code=404, detail="Could not resolve final link")
+        return {"stream_url": final_link}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/auto-stream")
+async def get_auto_stream(movie_url: str):
+    """Tamil: resolve the best stream for a movie in one call.
+
+    Quality preference 1080p > 720p > …, then the largest file at the final
+    level (size-optimised).
+    """
+    try:
+        data = await _content_scraper.get_qualities(movie_url)
+        qualities = data.get("qualities", [])
+        if not qualities:
+            raise HTTPException(status_code=404, detail="No qualities found")
+
+        quality_priority = ["1080", "720", "640", "480", "original", "hd"]
+        selected_quality = None
+        for priority in quality_priority:
+            for q in qualities:
+                if priority in q["name"].lower():
+                    selected_quality = q
+                    break
+            if selected_quality:
+                break
+        if not selected_quality:
+            selected_quality = qualities[0]
+
+        files = await _content_scraper.get_files(selected_quality["link"])
+        if not files:
+            raise HTTPException(status_code=404, detail="No files found")
+
+        non_sample_files = [f for f in files if "sample" not in f["name"].lower()]
+        candidates_l4 = non_sample_files if non_sample_files else files
+
+        selected_file = None
+        for priority in quality_priority:
+            for f in candidates_l4:
+                if priority in f["name"].lower():
+                    selected_file = f
+                    break
+            if selected_file:
+                break
+        if not selected_file:
+            selected_file = candidates_l4[0]
+
+        servers = await _content_scraper.get_servers(selected_file["link"])
+        if not servers:
+            raise HTTPException(status_code=404, detail="No servers found")
+
+        non_sample_servers = [s for s in servers if "sample" not in s["server"].lower()]
+        candidates_l5 = non_sample_servers if non_sample_servers else servers
+
+        def parse_size_mb(text: str) -> float:
+            match = re.search(r"(\d+(?:\.\d+)?)\s*(GB|MB)", text, re.IGNORECASE)
+            if not match:
+                return 0.0
+            val = float(match.group(1))
+            return val * 1024 if match.group(2).upper() == "GB" else val
+
+        target_server = max(candidates_l5, key=lambda s: parse_size_mb(s["server"]))
+
+        final_link = await _content_scraper.resolve_final_link(target_server["link"], depth=0)
+        if not final_link:
+            raise HTTPException(status_code=404, detail="Could not resolve final link")
+
+        return {
+            "stream_url": final_link,
+            "quality": selected_quality["name"],
+            "filename": selected_file["name"],
+            "server_label": target_server["server"],
+            "poster": data.get("meta", {}).get("poster"),
+            "desc": data.get("meta", {}).get("desc"),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error in auto-stream: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 if __name__ == "__main__":

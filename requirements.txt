@@ -3,3 +3,9 @@ uvicorn[standard]==0.35.0
 httpx==0.28.1
 curl_cffi==0.13.0
 wasmtime==47.0.1
+beautifulsoup4==4.12.3
+lxml==5.2.2
+fake-useragent==1.5.1
+motor==3.7.1
+dnspython==2.6.1
+python-dotenv==1.0.1

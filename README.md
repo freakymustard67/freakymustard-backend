@@ -33,6 +33,8 @@ variant playlists and media segments.
 | `GET /resolve/tv/{imdb_id}/{s}/{e}` | Resolve TV episode HLS sources |
 | `GET /hls/{token}` | HLS master/variant playlists (URL-rewritten) + media segments (streamed, Range supported) |
 | `GET /download/{token}?filename=…` | Assemble a resolved stream into one MPEG-TS file (best variant, attachment download) |
+| `GET /api/english/…` | English catalogue + details + embed servers (Cinemeta metadata) and Torrentio |
+| `GET /api/years`, `/api/movies`, `/api/details`, `/api/files`, `/api/stream`, `/api/auto-stream`, `/api/search` | Tamil catalogue via the Moviesda scraper |
 
 Every `/hls` URL is HMAC-signed and embeds the exact upstream URL, so this
 service cannot be abused as an open proxy.
@@ -48,6 +50,8 @@ service cannot be abused as an open proxy.
 | Var | Default | Purpose |
 | --- | --- | --- |
 | `PROXY_SECRET` | (dev default) | HMAC secret for URL signing — **set in production** |
+| `MONGO_URI` | (none) | MongoDB Atlas connection for the Tamil index (indexing disabled without it) |
+| `INDEX_ON_START` | `1` | Set `0` to skip the background Tamil re-index at startup |
 | `PUBLIC_BASE_URL` | auto | Base URL embedded in returned HLS links |
 | `ALLOWED_ORIGINS` | `*` | CORS origins (comma-separated) |
 | `RESOLVE_TTL` | `240` | Seconds to cache resolve results |
