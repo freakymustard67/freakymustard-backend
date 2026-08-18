@@ -11,6 +11,7 @@ it just updates the ``link`` field of the existing doc.
 
 import asyncio
 import os
+import urllib.parse
 
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo.errors import DuplicateKeyError
@@ -182,21 +183,34 @@ class MovieIndexer:
         return results
 
     async def enrich_metadata(self, movies):
-        """Enrich live-scraped movies with cached metadata (matched by path)."""
-        if self.collection is None:
-            return movies
+        """Enrich live-scraped movies with cached metadata (matched by path).
 
+        Cached docs (MongoDB) are merged in instantly. Movies missing from the
+        cache — typically brand-new releases the background sweep has not
+        reached yet — are enriched on demand: the detail page is scraped once
+        for poster/description, the result is upserted, and every later call
+        hits the cache. Scraping is bounded (3 concurrent) and failure-safe:
+        a dead-mirror link is retried against the current domain, and any
+        leftover failure returns the bare movie instead of erroring the list.
+        """
         keys = [path_key(m.get("link")) for m in movies]
         keys = [k for k in keys if k]
         if not keys:
             return movies
 
-        cursor = self.collection.find({"path_key": {"$in": keys}})
-        cached_docs = await cursor.to_list(length=len(keys))
-        cached_map = {d.get("path_key"): d for d in cached_docs}
+        cached_map = {}
+        if self.collection is not None:
+            cursor = self.collection.find({"path_key": {"$in": keys}})
+            cached_docs = await cursor.to_list(length=len(keys))
+            cached_map = {d.get("path_key"): d for d in cached_docs}
 
-        for movie in movies:
-            cached = cached_map.get(path_key(movie.get("link")))
+        sem = asyncio.Semaphore(3)
+
+        async def _enrich(movie: dict) -> None:
+            key = path_key(movie.get("link"))
+            if not key:
+                return
+            cached = cached_map.get(key)
             if cached:
                 # Prefer the cached LIVE link — it is kept current by the
                 # indexer even when the mirror domain moves.
@@ -206,5 +220,63 @@ class MovieIndexer:
                     movie["poster"] = cached["poster"]
                 if not movie.get("desc") and cached.get("desc"):
                     movie["desc"] = cached["desc"]
+                return
+            if movie.get("poster") and movie.get("desc"):
+                return
 
+            # Cache miss: pull poster/desc from the detail page right now.
+            async with sem:
+                try:
+                    details = await self.scraper.get_qualities(movie["link"])
+                except Exception:
+                    # The listing page sometimes serves absolute links to a
+                    # dead mirror (e.g. atamil.co). Retry the same path on
+                    # the domain the scraper currently resolves to.
+                    base = self.scraper.resolved_base
+                    if not base:
+                        try:
+                            # Fresh instance (no successful fetch yet) —
+                            # bootstrap the current domain from the landing
+                            # page's year links (gotopage.top itself is a
+                            # static directory, not a serving mirror).
+                            years = await self.scraper.get_years()
+                            if years:
+                                p = urllib.parse.urlparse(years[0]["link"])
+                                base = self.scraper.resolved_base = f"{p.scheme}://{p.netloc}"
+                        except Exception:
+                            base = None
+                    fallback = canonical_link(base, key) if base else None
+                    if not fallback or fallback == movie["link"]:
+                        print(f"Enrich: no working link for {movie.get('title')}")
+                        return
+                    try:
+                        details = await self.scraper.get_qualities(fallback)
+                        movie["link"] = fallback
+                    except Exception as e:
+                        print(f"Enrich: live scrape failed for {movie.get('title')}: {e}")
+                        return
+
+                meta = details.get("meta", {})
+                if meta.get("poster"):
+                    movie["poster"] = meta["poster"]
+                if meta.get("desc"):
+                    movie["desc"] = meta["desc"]
+                if self.collection is not None and movie.get("poster"):
+                    await self._upsert(movie)
+
+        await asyncio.gather(*(_enrich(m) for m in movies))
         return movies
+
+    async def index_forever(self) -> None:
+        """Periodic background sweep: index now, then repeat every interval.
+
+        The one-shot startup sweep leaves a poster gap for every movie the
+        site publishes after boot; repeating the sweep keeps the Mongo cache
+        (posters, descriptions, mirror-rewritten links) fresh. A sweep only
+        deep-scrapes movies it has not indexed yet, so steady-state runs are
+        cheap. Interval in hours, env INDEX_INTERVAL_HOURS (default 1).
+        """
+        interval = float(os.environ.get("INDEX_INTERVAL_HOURS", "1")) * 3600
+        while True:
+            await self.start_indexing()
+            await asyncio.sleep(interval)

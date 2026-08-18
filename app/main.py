@@ -109,11 +109,12 @@ async def cdn() -> httpx.AsyncClient:
 
 @app.on_event("startup")
 async def _startup() -> None:
-    # Content half: ensure the unique path_key index exists, then refresh the
-    # Tamil catalogue in the background (no-op without MONGO_URI). Set
-    # INDEX_ON_START=0 to disable (e.g. while debugging the streaming half).
+    # Content half: ensure the unique path_key index exists, then keep the
+    # Tamil catalogue indexed in the background — a sweep now and one every
+    # INDEX_INTERVAL_HOURS (no-op without MONGO_URI). Set INDEX_ON_START=0
+    # to disable (e.g. while debugging the streaming half).
     if os.environ.get("INDEX_ON_START", "1") != "0":
-        asyncio.create_task(_content_indexer.start_indexing())
+        asyncio.create_task(_content_indexer.index_forever())
 
 
 @app.on_event("shutdown")
