@@ -32,7 +32,9 @@ service can never be abused as an open proxy.
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 import os
+import logging
 import re
 import time
 from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlparse, urlunparse
@@ -50,13 +52,24 @@ from indexer import MovieIndexer
 from scraper import MoviesdaScraper
 
 VERSION = "3.0.0"
+logger = logging.getLogger("potato")
+_DEPLOY_SYNC_MARKER = "stream-proxy→potato-space"  # gate: potato deploy must mirror this source
 ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "*")
 RESOLVE_TTL = int(os.environ.get("RESOLVE_TTL", "240"))  # master-url resolve cache
 HLS_TOKEN_TTL = int(os.environ.get("HLS_TOKEN_TTL", "21600"))  # signed url validity (6h)
 UPSTREAM_TOKEN_TTL = int(os.environ.get("UPSTREAM_TOKEN_TTL", "180"))  # per-host token cache
 CHUNK = 256 * 1024
 
-app = FastAPI(title="FreakyMustard Proxy", version=VERSION, docs_url=None, redoc_url=None)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    if os.environ.get("INDEX_ON_START", "1") != "0":
+        asyncio.create_task(_content_indexer.index_forever())
+    yield
+    if _client and not _client.is_closed:
+        await _client.aclose()
+    await _content_scraper.client.aclose()
+
+app = FastAPI(title="FreakyMustard Proxy", version=VERSION, docs_url=None, redoc_url=None, lifespan=lifespan)
 app.include_router(english_router)
 
 app.add_middleware(
@@ -105,23 +118,6 @@ async def cdn() -> httpx.AsyncClient:
             follow_redirects=True, timeout=httpx.Timeout(30.0, read=120.0)
         )
     return _client
-
-
-@app.on_event("startup")
-async def _startup() -> None:
-    # Content half: ensure the unique path_key index exists, then keep the
-    # Tamil catalogue indexed in the background — a sweep now and one every
-    # INDEX_INTERVAL_HOURS (no-op without MONGO_URI). Set INDEX_ON_START=0
-    # to disable (e.g. while debugging the streaming half).
-    if os.environ.get("INDEX_ON_START", "1") != "0":
-        asyncio.create_task(_content_indexer.index_forever())
-
-
-@app.on_event("shutdown")
-async def _close() -> None:
-    if _client and not _client.is_closed:
-        await _client.aclose()
-    await _content_scraper.client.aclose()
 
 
 def _rate_limited(ip: str) -> bool:
@@ -724,8 +720,9 @@ async def get_years():
     """Tamil Level 1: year categories."""
     try:
         return await _content_scraper.get_years()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:  # noqa: BLE001
+        logger.exception("get_years failed")
+        raise HTTPException(status_code=500, detail="failed to fetch year categories")
 
 
 @app.get("/api/movies")
@@ -751,11 +748,9 @@ async def get_movies(year_url: str, pages: int = 3):
                 break  # page doesn't exist
 
         return await _content_indexer.enrich_metadata(all_movies)
-    except Exception as e:
-        import traceback
-
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:  # noqa: BLE001
+        logger.exception("get_movies failed")
+        raise HTTPException(status_code=500, detail="failed to fetch movies")
 
 
 @app.get("/api/details")
@@ -764,8 +759,9 @@ async def get_movie_details(movie_url: str):
     try:
         data = await _content_scraper.get_qualities(movie_url)
         return data.get("qualities", [])
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:  # noqa: BLE001
+        logger.exception("get_qualities failed")
+        raise HTTPException(status_code=500, detail="failed to fetch qualities")
 
 
 @app.get("/api/files")
@@ -773,8 +769,9 @@ async def get_files(quality_url: str):
     """Tamil Level 4: files inside a quality folder."""
     try:
         return await _content_scraper.get_files(quality_url)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:  # noqa: BLE001
+        logger.exception("get_files failed")
+        raise HTTPException(status_code=500, detail="failed to fetch files")
 
 
 @app.get("/api/stream")
@@ -791,8 +788,9 @@ async def get_stream_link(file_url: str, request: Request):
         }
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:  # noqa: BLE001
+        logger.exception("get_stream_link failed")
+        raise HTTPException(status_code=500, detail="failed to resolve stream")
 
 
 @app.get("/api/auto-stream")
@@ -871,9 +869,9 @@ async def get_auto_stream(movie_url: str, request: Request):
         }
     except HTTPException:
         raise
-    except Exception as e:
-        print(f"Error in auto-stream: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:  # noqa: BLE001
+        logger.exception("auto-stream failed")
+        raise HTTPException(status_code=500, detail="failed to resolve auto-stream")
 
 
 @app.get("/api/series")
@@ -882,8 +880,9 @@ async def get_series(page: int = 1):
     try:
         results = await _content_scraper.get_series_list(page)
         return {"page": page, "results": results, "has_more": len(results) > 0}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:  # noqa: BLE001
+        logger.exception("get_series failed")
+        raise HTTPException(status_code=500, detail="failed to fetch series")
 
 
 @app.get("/api/seasons")
@@ -892,8 +891,9 @@ async def get_seasons(series_url: str):
     try:
         data = await _content_scraper.get_seasons(series_url)
         return data
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:  # noqa: BLE001
+        logger.exception("get_seasons failed")
+        raise HTTPException(status_code=500, detail="failed to fetch seasons")
 
 
 @app.get("/api/episodes")
@@ -901,8 +901,9 @@ async def get_episodes(season_url: str, pages: int = 10):
     """Episodes of a season, oldest first."""
     try:
         return await _content_scraper.get_episodes(season_url, pages)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:  # noqa: BLE001
+        logger.exception("get_episodes failed")
+        raise HTTPException(status_code=500, detail="failed to fetch episodes")
 
 
 @app.get("/api/episode-stream")
@@ -919,8 +920,9 @@ async def get_episode_stream(episode_url: str, request: Request):
         }
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:  # noqa: BLE001
+        logger.exception("get_episode_stream failed")
+        raise HTTPException(status_code=500, detail="failed to resolve episode stream")
 
 
 if __name__ == "__main__":
