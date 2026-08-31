@@ -344,6 +344,11 @@ async def backup_engine_file(
     # name arrives decoded by FastAPI; re-encode for upstream
     safe_name = quote(name, safe="._-")
     upstream = f"{base}/d/{info_hash.lower()}/{file_idx}/{safe_name}"
+    # forward download hint to the sidecar as well (so it also sends attachment)
+    if request.query_params.get("download") == "1":
+        upstream += "?download=1"
+    elif request.query_params.get("attachment") == "1":
+        upstream += "?attachment=1"
 
     client = await _get_client()
     headers = {}
@@ -366,6 +371,13 @@ async def backup_engine_file(
         if h in resp.headers:
             passthrough[h] = resp.headers[h]
     passthrough.setdefault("Access-Control-Allow-Origin", "*")
+    # Download vs player: engine normally sends `inline` so <video> can play.
+    # When ?download=1 is present (triggerDownload for torrents), force `attachment`.
+    if request.query_params.get("download") == "1" or request.query_params.get("attachment") == "1":
+        safe_disp = (name or "video.mp4").replace('"', "").replace(";", "")[:150]
+        passthrough["Content-Disposition"] = f'attachment; filename="{safe_disp}"; filename*=UTF-8\'\'{quote(safe_disp)}'
+    elif "content-disposition" in resp.headers:
+        passthrough["Content-Disposition"] = resp.headers["content-disposition"]
 
     async def streamer():
         try:

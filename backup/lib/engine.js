@@ -230,7 +230,8 @@ async function handleEngineRequest(engine, pathname, searchParams, req, res, log
   const total = file.length;
   const type = engine.contentType(file.name);
   res.setHeader('Content-Type', type);
-  res.setHeader('Content-Disposition', `inline; filename="${file.name.replace(/"/g, '')}"`);
+  const wantDownload = searchParams.get('download') === '1' || searchParams.get('attachment') === '1';
+  res.setHeader('Content-Disposition', `${wantDownload ? 'attachment' : 'inline'}; filename="${file.name.replace(/"/g, '')}"`);
   res.setHeader('X-Stream-File', file.name);
 
   const range = req.headers.range;
