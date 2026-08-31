@@ -48,6 +48,7 @@ from cache import TTLCache
 from signing import sign_url, verify_token
 from vidsrc import StreamResult, VidSrcError, resolve_movie, resolve_tv, UA
 from english import router as english_router
+from backup import router as backup_router
 from indexer import MovieIndexer
 from scraper import MoviesdaScraper
 
@@ -68,9 +69,17 @@ async def lifespan(app: FastAPI):
     if _client and not _client.is_closed:
         await _client.aclose()
     await _content_scraper.client.aclose()
+    # also close backup sidecar client
+    try:
+        from backup import _close_client as _close_backup_client
+
+        await _close_backup_client()
+    except Exception:
+        pass
 
 app = FastAPI(title="FreakyMustard Proxy", version=VERSION, docs_url=None, redoc_url=None, lifespan=lifespan)
 app.include_router(english_router)
+app.include_router(backup_router)
 
 app.add_middleware(
     CORSMiddleware,
