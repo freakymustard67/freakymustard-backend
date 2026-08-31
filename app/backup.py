@@ -214,9 +214,31 @@ async def backup_streams(
         upstream_id = id
         media_type = "movie"
 
-    _, data = await _fetch_json(
-        _base_for(instance), f"/api/streams?type={type}&id={quote(upstream_id)}", request
-    )
+    try:
+        _, data = await _fetch_json(
+            _base_for(instance), f"/api/streams?type={type}&id={quote(upstream_id)}", request
+        )
+    except HTTPException as exc:
+        # On HF the sidecars aren't deployed (no 8101/8102) — don't 502 the page,
+        # just return an empty backup set so the main servers keep working.
+        # The frontend shows "No backup streams" without a noisy 502 toast.
+        return JSONResponse(
+            {
+                "provider": "freaky-backup",
+                "instance": instance,
+                "mediaType": media_type,
+                "sourceId": upstream_id,
+                "sources": [],
+                "torrents": [],
+                "meta": {
+                    "total": 0,
+                    "playable": 0,
+                    "torrent": 0,
+                    "error": str(getattr(exc, "detail", exc)),
+                    "unavailable": True,
+                },
+            }
+        )
 
     raw_streams = data.get("streams", [])
     base = _public_base(request)
