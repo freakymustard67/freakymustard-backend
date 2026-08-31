@@ -1,0 +1,40 @@
+{
+  "instance": "english",
+  "displayName": "Freaky Backup \u00b7 English",
+  "addonId": "community.freakybackup.english",
+  "version": "1.0.0",
+  "description": "Backup stream resolver for English movies & series. Aggregates HDHub, DesiFlix and Torrentio. Standalone fallback for freaky mustard.",
+  "accent": "#4f8cff",
+  "accent2": "#22d3ee",
+  "port": 8101,
+  "host": "0.0.0.0",
+  "publicBaseUrl": "",
+  "cacheTtlSeconds": 600,
+  "upstreamTimeoutMs": 15000,
+  "engine": {
+    "enabled": true,
+    "maxTorrents": 3,
+    "idleEvictMs": 900000
+  },
+  "upstreams": [
+    {
+      "name": "HDHub",
+      "tag": "HDHub",
+      "baseUrl": "https://hdhub.thevolecitor.qzz.io",
+      "types": ["movie", "series"]
+    },
+    {
+      "name": "DesiFlix",
+      "tag": "DesiFlix",
+      "baseUrl": "https://manifest.desitvhub.eu.org",
+      "types": ["movie", "series"]
+    },
+    {
+      "name": "Torrentio",
+      "tag": "Torrentio",
+      "baseUrl": "https://torrentio.strem.fun",
+      "types": ["movie", "series"],
+      "torrent": true
+    }
+  ]
+}

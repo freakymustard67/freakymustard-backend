@@ -1,0 +1,42 @@
+{
+  "instance": "tamil",
+  "displayName": "Freaky Backup \u00b7 Tamil",
+  "addonId": "community.freakybackup.tamil",
+  "version": "1.0.0",
+  "description": "Backup stream resolver for Tamil & Indian movies/series. Aggregates Torrentio (TamilBlasters/TamilMV/other Indian trackers), DesiFlix and MediaFusion. Standalone fallback for freaky mustard.",
+  "accent": "#ff6b35",
+  "accent2": "#ffd166",
+  "port": 8102,
+  "host": "0.0.0.0",
+  "publicBaseUrl": "",
+  "cacheTtlSeconds": 600,
+  "upstreamTimeoutMs": 15000,
+  "engine": {
+    "enabled": true,
+    "maxTorrents": 3,
+    "idleEvictMs": 900000
+  },
+  "upstreams": [
+    {
+      "name": "Torrentio \u00b7 Tamil trackers",
+      "tag": "TTorrent",
+      "baseUrl": "https://torrentio.strem.fun/providers=yts,eztv,rarbg,1337x,thepiratebay,kickasstorrents,torrentgalaxy,magnetdl,horriblesubs,nyaasi,tokyotosho,anidex,rutor,kufirc,pantaflix,tamilblasters,tamilmv,torrentdownloads",
+      "types": ["movie", "series"],
+      "torrent": true
+    },
+    {
+      "name": "DesiFlix",
+      "tag": "DesiFlix",
+      "baseUrl": "https://manifest.desitvhub.eu.org",
+      "types": ["movie", "series"]
+    },
+    {
+      "name": "MediaFusion",
+      "tag": "MF",
+      "baseUrl": "https://mediafusion.elfhosted.com",
+      "types": ["movie", "series"],
+      "torrent": true,
+      "optional": true
+    }
+  ]
+}
