@@ -210,14 +210,19 @@ const server = http.createServer(async (req, res) => {
     }
     const r = await fetchText(target, { timeoutMs: 25000, maxBytes: 300 * 1024 });
     const title = ((r.text || '').match(/<title[^>]*>([^<]{0,140})/i) || [])[1] || '';
+    // `grep` scans the WHOLE page rather than the first 40 anchors. Search
+    // results sit far below a very large nav block, so the capped list shows
+    // only menus and makes a working page look empty.
+    const grep = (url.searchParams.get('grep') || '').toLowerCase();
     const anchors = [];
     const re = /<a\b[^>]*href\s*=\s*["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
     let m;
-    while ((m = re.exec(r.text || '')) && anchors.length < 40) {
-      anchors.push({
-        href: m[1].slice(0, 110),
-        text: m[2].replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 70)
-      });
+    while ((m = re.exec(r.text || ''))) {
+      const href = m[1];
+      const text = m[2].replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+      if (grep && !`${href} ${text}`.toLowerCase().includes(grep)) continue;
+      anchors.push({ href: href.slice(0, 120), text: text.slice(0, 80) });
+      if (anchors.length >= (grep ? 25 : 40)) break;
     }
     // Forms matter here: several of these sites search via a GET form whose
     // action and input names are the only way to build the search URL.
