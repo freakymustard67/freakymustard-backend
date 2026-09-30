@@ -377,20 +377,41 @@ async function runSite(site, ctx, timeoutMs = 15000) {
   const base = await liveBase(site, timeoutMs);
   if (!base) return { ok: false, streams: [], ms: Date.now() - started, error: 'no live domain' };
 
-  const q = encodeURIComponent(`${want}${ctx.year ? ` ${ctx.year}` : ''}`);
-  const path = String(site.searchPath || '/?s={q}').replace('{q}', q);
-  const searchUrl = path.startsWith('http') ? path : `${base}${path.startsWith('/') ? '' : '/'}${path}`;
+  // Query shapes matter and are not guessable: MovieRulz returns the film for
+  // "Leo" but answers "No result found" for "Leo 2023", while other sites index
+  // on title+year. Try each shape in turn and keep the first that matches.
+  const year = ctx.year || yearOf(want);
+  const shapes = Array.isArray(site.searchQueries) && site.searchQueries.length
+    ? site.searchQueries
+    : ['{title}', '{title} {year}'];
 
-  const search = await fetchText(searchUrl, { timeoutMs });
-  if (search.ok && isSoft404(search.text)) {
-    return { ok: true, streams: [], ms: Date.now() - started, searched: searchUrl, error: 'soft-404 (no such page)' };
-  }
-  if (!search.ok) {
-    return { ok: false, streams: [], ms: Date.now() - started, error: `search: ${search.error}`, searched: searchUrl };
+  let posts = [];
+  let searched = '';
+  let search = null;
+  for (const shape of shapes) {
+    const q = encodeURIComponent(
+      String(shape).replace('{title}', want).replace('{year}', year || '').trim()
+    );
+    const path = String(site.searchPath || '/?s={q}').replace('{q}', q);
+    const searchUrl = path.startsWith('http') ? path : `${base}${path.startsWith('/') ? '' : '/'}${path}`;
+    searched = searchUrl;
+    // eslint-disable-next-line no-await-in-loop
+    const attempt = await fetchText(searchUrl, { timeoutMs });
+    if (!attempt.ok || isSoft404(attempt.text)) continue;
+    // A miss is a 200 that says so; treat it as a miss rather than a result.
+    if (/no result found/i.test(attempt.text)) continue;
+    const found = findPostLinks(attempt.text, attempt.url || base, want, year);
+    if (found.length) {
+      posts = found;
+      search = attempt;
+      break;
+    }
+    if (!search) search = attempt;
   }
 
-  let posts = findPostLinks(search.text, search.url || base, want, ctx.year || yearOf(want));
-  let searched = searchUrl;
+  if (!search) {
+    return { ok: true, streams: [], ms: Date.now() - started, searched, error: 'search unavailable (soft-404 or fetch failure)' };
+  }
 
   // Some of these sites have a search form that is simply not wired up
   // server-side (Moviesda ignores ?q= entirely and always returns the default
