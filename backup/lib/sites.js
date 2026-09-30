@@ -78,6 +78,25 @@ function slugText(url) {
   }
 }
 
+/**
+ * Like slugText but keeps the WHOLE path: a download chain lives at
+ * /movie/<slug>/original/1080p-hd/ and /download/<slug>-1080p-hd/, where the
+ * last segment alone ("1080p hd") says nothing about which film it is.
+ */
+function slugTextFull(url) {
+  try {
+    return new URL(url).pathname
+      .split('/')
+      .filter(Boolean)
+      .map((seg) => decodeURIComponent(seg).replace(/[-_+]+/g, ' '))
+      .join(' ')
+      .replace(/\.(html?|php)$/i, '')
+      .trim();
+  } catch {
+    return '';
+  }
+}
+
 function yearOf(text) {
   const m = String(text || '').match(/\b(19|20)\d{2}\b/);
   return m ? m[0] : '';
@@ -315,6 +334,14 @@ async function crawlForLinks(startUrl, base, opts) {
       const page = await fetchText(pageUrl, { timeoutMs });
       if (!page.ok || isSoft404(page.text)) continue;
       const here = page.url || pageUrl;
+
+      // Film pages link to related films. Without this guard the crawl wanders
+      // onto one and harvests ITS links, attaching another film's sources to
+      // the title the user asked for (observed: Leo returned Spider-Man
+      // torrents). Every page in a film's own chain carries the film in its
+      // path, so require that.
+      if (!titleMatches(slugTextFull(here), want, year)) continue;
+
       for (const link of findHostLinks(page.text, here, linkHosts)) {
         if (!found.some((f) => f.url === link.url)) found.push({ ...link, depth });
       }
@@ -324,10 +351,10 @@ async function crawlForLinks(startUrl, base, opts) {
       if (found.length) return found; // first depth that pays out wins
       if (depth === maxDepth) continue;
       for (const link of interestingLinks(page.text, here, origin)) {
-        if (!seen.has(link)) {
-          seen.add(link);
-          next.push(link);
-        }
+        if (seen.has(link)) continue;
+        if (!titleMatches(slugTextFull(link), want, year)) continue;
+        seen.add(link);
+        next.push(link);
       }
     }
     frontier = next;
@@ -451,4 +478,4 @@ async function probeSite(site, timeoutMs = 10000) {
   return { ok: Boolean(base), base, ms: Date.now() - started, error: base ? undefined : 'no live domain' };
 }
 
-module.exports = { runSite, isSiteUpstream, probeSite, findHostLinks, findMagnets, findPostLinks, titleMatches, crawlForLinks, interestingLinks, slugText, isSoft404 };
+module.exports = { runSite, isSiteUpstream, probeSite, findHostLinks, findMagnets, findPostLinks, titleMatches, crawlForLinks, interestingLinks, slugText, slugTextFull, isSoft404 };
