@@ -27,6 +27,7 @@ const fs = require('fs');
 const path = require('path');
 
 const { runSite, isSiteUpstream } = require('./lib/sites');
+const { fetchText } = require('./lib/util');
 const { resolveHost } = require('./lib/resolvers');
 
 const PORT = Number(process.env.PORT || 8080);
@@ -152,6 +153,39 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Debug aid for keeping the drivers alive as these sites change their
+  // markup. Restricted to hosts already configured as sites, so it is not an
+  // open proxy.
+  if (url.pathname === '/api/inspect') {
+    const target = url.searchParams.get('url') || '';
+    const allowed = SITES.some((s) =>
+      (s.domains || []).some((d) => {
+        const host = String(d).replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+        return target.includes(host);
+      })
+    );
+    if (!allowed) {
+      json(res, 403, { error: 'host is not one of the configured sites' });
+      return;
+    }
+    const r = await fetchText(target, { timeoutMs: 25000, maxBytes: 300 * 1024 });
+    const title = ((r.text || '').match(/<title[^>]*>([^<]{0,140})/i) || [])[1] || '';
+    const anchors = [];
+    const re = /<a\b[^>]*href\s*=\s*["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+    let m;
+    while ((m = re.exec(r.text || '')) && anchors.length < 40) {
+      anchors.push({
+        href: m[1].slice(0, 110),
+        text: m[2].replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 70)
+      });
+    }
+    json(res, 200, {
+      ok: r.ok, status: r.status, finalUrl: r.url, bytes: r.bytes,
+      error: r.error || null, title, anchors
+    });
+    return;
+  }
+
   if (url.pathname === '/api/resolve') {
     const target = url.searchParams.get('url') || '';
     const result = await resolveHost(target, { timeoutMs: 20000 });
@@ -159,7 +193,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  json(res, 404, { error: 'not found', endpoints: ['/health', '/api/scrape', '/api/resolve'] });
+  json(res, 404, { error: 'not found', endpoints: ['/health', '/api/scrape', '/api/resolve', '/api/inspect'] });
 });
 
 server.listen(PORT, '0.0.0.0', () => {
