@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "comment": "Direct Tamil-site extractors. These run as their OWN Render service because a crawl is multi-hop and slow (20-40s), which the main sidecar's 18s fan-out deadline cannot afford, and because reachability depends on the region/ASN this runs in. Domains rotate every few weeks: add candidates rather than replacing, and the driver uses whichever answers. 1TamilMV dropped: magnets only (already covered by Torrentio) and it spent 13s of budget for nothing. Moviesda's ?q= search is ignored server-side, so it uses listingPaths + slug matching instead. inspectFamilies widens /api/inspect + /api/probe to any mirror of a family we already target (domains rotate weekly), without becoming an open proxy.",
+  "comment": "Direct Tamil-site extractors. These run as their OWN Render service because a crawl is multi-hop and slow (20-40s), which the main sidecar's 18s fan-out deadline cannot afford, and because reachability depends on the region/ASN this runs in. Domains rotate every few weeks: add candidates rather than replacing, and the driver uses whichever answers. 1TamilMV dropped: magnets only (already covered by Torrentio) and it spent 13s of budget for nothing. Moviesda's ?q= search is ignored server-side, so it uses listingPaths + slug matching instead. inspectFamilies widens /api/inspect + /api/probe to any mirror of a family we already target (domains rotate weekly), without becoming an open proxy. MovieRulz's real search is /search_movies?s= (the ?s= form returns the homepage); its buttons point at embed/stream hosts, not file hosts, and magnets come from findMagnets.",
   "sites": [
     {
       "name": "Moviesda",
@@ -40,16 +40,27 @@
       "driver": "site",
       "domains": [
         "www.5movierulz2.cafe",
-        "5movierulz2.cafe"
+        "5movierulz2.cafe",
+        "www.5movierulz2.sarl"
       ],
-      "searchPath": "/?s={q}",
+      "searchPath": "/search_movies?s={q}",
       "linkHosts": [
-        "hubcloud",
-        "hubdrive",
-        "gdflix",
-        "pixeldrain",
-        "r2.dev",
-        "googleusercontent"
+        "gofile",
+        "tapepops",
+        "streamtape",
+        "easysyncr",
+        "vcdnlare",
+        "streamhub",
+        "uperbox",
+        "niramirus",
+        "streamwish",
+        "callistanise",
+        "filelions",
+        "morencius",
+        "pixibay",
+        "hgcloud",
+        "hqq.ac",
+        "waaw"
       ],
       "crawlDepth": 2,
       "maxPages": 2,
@@ -57,7 +68,11 @@
       "types": [
         "movie",
         "series"
-      ]
+      ],
+      "listingPaths": [
+        "/movies/page/{page}"
+      ],
+      "listingPages": 3
     },
     {
       "name": "Tamilgun",
@@ -80,14 +95,32 @@
       "types": [
         "movie",
         "series"
+      ],
+      "listingPaths": [
+        "/page/{page}"
       ]
     }
   ],
   "inspectFamilies": [
+    "5movierulz",
+    "callistanise",
+    "easysyncr",
+    "filelions",
+    "gofile",
+    "hgcloud",
+    "hqq.ac",
+    "huntrexus",
+    "morencius",
     "movierulz",
-    "tamilgun",
     "moviesda",
     "moviezda",
-    "5movierulz"
+    "niramirus",
+    "pixibay",
+    "streamwish",
+    "tamilgun",
+    "tapepops",
+    "uperbox",
+    "vcdnlare",
+    "waaw"
   ]
 }

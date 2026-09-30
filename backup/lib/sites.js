@@ -199,6 +199,16 @@ function findMagnets(html) {
   return out;
 }
 
+/**
+ * These sites soft-404: a missing path returns HTTP 200 with an error page
+ * rather than a 404 status (MovieRulz: title "Error 404 | Movierulz"). Checking
+ * the status alone would treat a dead film link as a hit and parse junk.
+ */
+function isSoft404(html) {
+  const title = ((html || '').match(/<title[^>]*>([^<]{0,160})/i) || [])[1] || '';
+  return /error\s*404|not\s*found|page not found/i.test(title);
+}
+
 /** Pick the page links that are film pages rather than navigation. */
 function findPostLinks(html, base, want, year) {
   const out = [];
@@ -303,7 +313,7 @@ async function crawlForLinks(startUrl, base, opts) {
     const next = [];
     for (const pageUrl of frontier.slice(0, maxPages)) {
       const page = await fetchText(pageUrl, { timeoutMs });
-      if (!page.ok) continue;
+      if (!page.ok || isSoft404(page.text)) continue;
       const here = page.url || pageUrl;
       for (const link of findHostLinks(page.text, here, linkHosts)) {
         if (!found.some((f) => f.url === link.url)) found.push({ ...link, depth });
@@ -338,6 +348,9 @@ async function runSite(site, ctx, timeoutMs = 15000) {
   const searchUrl = path.startsWith('http') ? path : `${base}${path.startsWith('/') ? '' : '/'}${path}`;
 
   const search = await fetchText(searchUrl, { timeoutMs });
+  if (search.ok && isSoft404(search.text)) {
+    return { ok: true, streams: [], ms: Date.now() - started, searched: searchUrl, error: 'soft-404 (no such page)' };
+  }
   if (!search.ok) {
     return { ok: false, streams: [], ms: Date.now() - started, error: `search: ${search.error}`, searched: searchUrl };
   }
@@ -388,10 +401,12 @@ async function runSite(site, ctx, timeoutMs = 15000) {
       seenUrl.add(dedupe);
 
       if (link.infoHash && !link.url) {
-        const q = (link.context.match(/\b(2160p|4k|uhd|1080p|720p|480p)\b/i) || [])[1] || '';
+        const q =
+          (link.context.match(/\b(2160p|4k|uhd|1080p|720p|480p|240p|320p)\b/i) || [])[1] || '';
+        const size = (link.context.match(/\b\d+(?:\.\d+)?\s*(?:gb|mb)\b/i) || [])[0] || '';
         streams.push({
           name: `${site.tag || site.name} ${q || 'torrent'}`.trim(),
-          title: [link.label, q].filter(Boolean).join('\n'),
+          title: [link.label, q, size].filter(Boolean).join('\n'),
           infoHash: link.infoHash,
           sources: (link.magnet.match(/[?&]tr=([^&]+)/g) || []).map((t) =>
             decodeURIComponent(t.replace(/^[?&]tr=/, ''))
@@ -436,4 +451,4 @@ async function probeSite(site, timeoutMs = 10000) {
   return { ok: Boolean(base), base, ms: Date.now() - started, error: base ? undefined : 'no live domain' };
 }
 
-module.exports = { runSite, isSiteUpstream, probeSite, findHostLinks, findMagnets, findPostLinks, titleMatches, crawlForLinks, interestingLinks, slugText };
+module.exports = { runSite, isSiteUpstream, probeSite, findHostLinks, findMagnets, findPostLinks, titleMatches, crawlForLinks, interestingLinks, slugText, isSoft404 };
