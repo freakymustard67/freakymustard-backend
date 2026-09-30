@@ -489,7 +489,7 @@ async function runSite(site, ctx, timeoutMs = 15000) {
     ok: true,
     streams,
     ms: Date.now() - started,
-    searched: searchUrl,
+    searched,
     // Which film URLs the search matched. Without this, "found nothing" is
     // indistinguishable from "matched the wrong page" when debugging a driver.
     matched: posts.map((p) => p.url).slice(0, 5),
