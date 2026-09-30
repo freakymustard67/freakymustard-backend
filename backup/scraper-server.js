@@ -258,10 +258,23 @@ const server = http.createServer(async (req, res) => {
       trackers: (m.magnet.match(/[?&]tr=([^&]+)/g) || []).length
     }));
     const magnetAnchors = ((r.text || '').match(/href\s*=\s*["']magnet:/gi) || []).length;
+    // `raw=<term>` returns text around each match. Some of these sites inject
+    // results with JS or embed them in a data blob rather than in anchors, so
+    // an anchor listing can show nothing while the page clearly has results.
+    const rawTerm = (url.searchParams.get('raw') || '').toLowerCase();
+    let raw = [];
+    if (rawTerm) {
+      const hay = (r.text || '').toLowerCase();
+      let idx = hay.indexOf(rawTerm);
+      while (idx !== -1 && raw.length < 12) {
+        raw.push((r.text || '').slice(Math.max(0, idx - 120), idx + 200).replace(/\s+/g, ' '));
+        idx = hay.indexOf(rawTerm, idx + rawTerm.length);
+      }
+    }
     json(res, 200, {
       ok: r.ok, status: r.status, finalUrl: r.url, bytes: r.bytes,
       error: r.error || null, title, forms, anchors,
-      magnetAnchors, magnets
+      magnetAnchors, magnets, raw
     });
     return;
   }
