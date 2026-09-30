@@ -754,12 +754,28 @@ async def search_movies(q: str):
 
 @app.get("/api/years")
 async def get_years():
-    """Tamil Level 1: year categories."""
+    """Tamil Level 1: year categories.
+
+    The source lists more than one page per year ("Tamil 2026 Movies" and
+    "Moviesda 2026 Movies"), which renders the same year twice on the portal.
+    Collapse to one entry per year, keeping the first (it is the richer page).
+    """
     try:
-        return await _content_scraper.get_years()
+        years = await _content_scraper.get_years()
     except Exception as e:  # noqa: BLE001
         logger.exception("get_years failed")
         raise HTTPException(status_code=500, detail="failed to fetch year categories")
+
+    seen: set[str] = set()
+    unique = []
+    for entry in years or []:
+        m = re.search(r"(19|20)\d{2}", str(entry.get("name", "")))
+        key = m.group(0) if m else str(entry.get("name", "")).strip().lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(entry)
+    return unique
 
 
 @app.get("/api/movies")

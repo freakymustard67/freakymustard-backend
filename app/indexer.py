@@ -11,6 +11,7 @@ it just updates the ``link`` field of the existing doc.
 
 import asyncio
 import os
+import re
 import urllib.parse
 
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -182,6 +183,64 @@ class MovieIndexer:
                 doc["_id"] = str(doc["_id"])
         return results
 
+    # Scraped titles often arrive with the page's metadata blob glued on:
+    #   "Hunkkaar The Roar (2026)7.8Cast:Devendra Patel...Genres:Crime, Thriller"
+    # The film name always ends at the year parenthesis, so everything after it
+    # is metadata that belongs in `desc`, not in a card or a hero heading.
+    _TITLE_BLOB_RE = re.compile(r"^(.*?\(\d{4}\))\s*", re.S)
+    _META_MARKER_RE = re.compile(
+        r"\s*(?:\d(?:\.\d)?\s*)?(?:Cast|Genres?|Director|Quality|Language|Rating|Original|Movie)\s*:",
+        re.I,
+    )
+
+    @classmethod
+    def _clean_title(cls, raw):
+        """Trim a scraped title back to the film name."""
+        text = (raw or "").strip()
+        if not text:
+            return text
+        m = cls._TITLE_BLOB_RE.match(text)
+        if m:
+            # Keep the year: it is the only part of the blob worth showing.
+            return m.group(1).strip()
+        cut = cls._META_MARKER_RE.split(text, maxsplit=1)[0].strip()
+        return cut or text
+
+    @staticmethod
+    def _rehost(url, base):
+        """Repoint a cached URL at the current mirror, keeping its path.
+
+        Poster and link URLs are stored in Mongo. When the mirror domain moves,
+        the stored URLs keep the old host and 404, which is why the Tamil grid
+        showed no artwork even though every row carried a poster field. `link`
+        was already kept current; posters were not.
+        """
+        if not url or not base:
+            return url
+        try:
+            src = urllib.parse.urlparse(url)
+            dst = urllib.parse.urlparse(base)
+            if not src.netloc or not dst.netloc or src.netloc == dst.netloc:
+                return url
+            return urllib.parse.urlunparse(
+                (dst.scheme, dst.netloc, src.path, src.params, src.query, src.fragment)
+            )
+        except Exception:  # noqa: BLE001
+            return url
+
+    async def _ensure_base(self):
+        """Current serving mirror, bootstrapped from the year index if unknown."""
+        if self.scraper.resolved_base:
+            return self.scraper.resolved_base
+        try:
+            years = await self.scraper.get_years()
+            if years:
+                parts = urllib.parse.urlparse(years[0]["link"])
+                self.scraper.resolved_base = f"{parts.scheme}://{parts.netloc}"
+        except Exception:  # noqa: BLE001
+            return None
+        return self.scraper.resolved_base
+
     async def enrich_metadata(self, movies):
         """Enrich live-scraped movies with cached metadata (matched by path).
 
@@ -205,8 +264,13 @@ class MovieIndexer:
             cached_map = {d.get("path_key"): d for d in cached_docs}
 
         sem = asyncio.Semaphore(3)
+        # Resolve once, up front: both the cached-poster rewrite and the dead
+        # mirror fallback below need to know the current domain.
+        base = await self._ensure_base()
 
         async def _enrich(movie: dict) -> None:
+            if movie.get("title"):
+                movie["title"] = self._clean_title(movie["title"])
             key = path_key(movie.get("link"))
             if not key:
                 return
@@ -217,7 +281,9 @@ class MovieIndexer:
                 if cached.get("link"):
                     movie["link"] = cached["link"]
                 if not movie.get("poster") and cached.get("poster"):
-                    movie["poster"] = cached["poster"]
+                    # Same treatment as the link: a cached poster on a retired
+                    # host renders as no artwork at all.
+                    movie["poster"] = self._rehost(cached["poster"], base)
                 if not movie.get("desc") and cached.get("desc"):
                     movie["desc"] = cached["desc"]
                 return
@@ -232,19 +298,6 @@ class MovieIndexer:
                     # The listing page sometimes serves absolute links to a
                     # dead mirror (e.g. atamil.co). Retry the same path on
                     # the domain the scraper currently resolves to.
-                    base = self.scraper.resolved_base
-                    if not base:
-                        try:
-                            # Fresh instance (no successful fetch yet) —
-                            # bootstrap the current domain from the landing
-                            # page's year links (gotopage.top itself is a
-                            # static directory, not a serving mirror).
-                            years = await self.scraper.get_years()
-                            if years:
-                                p = urllib.parse.urlparse(years[0]["link"])
-                                base = self.scraper.resolved_base = f"{p.scheme}://{p.netloc}"
-                        except Exception:
-                            base = None
                     fallback = canonical_link(base, key) if base else None
                     if not fallback or fallback == movie["link"]:
                         print(f"Enrich: no working link for {movie.get('title')}")
