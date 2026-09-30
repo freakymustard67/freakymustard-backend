@@ -303,10 +303,33 @@ async function runSite(site, ctx, timeoutMs = 15000) {
     return { ok: false, streams: [], ms: Date.now() - started, error: `search: ${search.error}`, searched: searchUrl };
   }
 
-  const posts = findPostLinks(search.text, search.url || base, want, ctx.year || yearOf(want));
+  let posts = findPostLinks(search.text, search.url || base, want, ctx.year || yearOf(want));
+  let searched = searchUrl;
+
+  // Some of these sites have a search form that is simply not wired up
+  // server-side (Moviesda ignores ?q= entirely and always returns the default
+  // listing). Fall back to walking their listing pages and matching slugs.
+  if (!posts.length && Array.isArray(site.listingPaths) && site.listingPaths.length) {
+    const pages = Math.min(site.listingPages || 3, 6);
+    outer: for (const tmpl of site.listingPaths) {
+      for (let page = 1; page <= pages; page += 1) {
+        const listUrl = tmpl.startsWith('http')
+          ? tmpl.replace('{page}', page)
+          : `${base}${tmpl.startsWith('/') ? '' : '/'}${tmpl}`.replace('{page}', page);
+        const listing = await fetchText(listUrl, { timeoutMs });
+        if (!listing.ok) continue;
+        const found = findPostLinks(listing.text, listing.url || base, want, ctx.year || yearOf(want));
+        if (found.length) {
+          posts = found;
+          searched = listUrl;
+          break outer;
+        }
+      }
+    }
+  }
+
   if (!posts.length) {
-    // Some sites render results client-side; the homepage may still link the film.
-    return { ok: true, streams: [], ms: Date.now() - started, searched: searchUrl, error: 'no matching results' };
+    return { ok: true, streams: [], ms: Date.now() - started, searched, error: 'no matching results' };
   }
 
   const streams = [];

@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "comment": "Direct Tamil-site extractors. These run as their OWN Render service because a crawl is multi-hop and slow (20-40s), which the main sidecar's 18s fan-out deadline cannot afford, and because reachability depends on the region/ASN this runs in. Domains rotate every few weeks: add candidates rather than replacing, and the driver uses whichever answers. 1TamilMV dropped: magnets only (already covered by Torrentio) and it spent 13s of budget for nothing.",
+  "comment": "Direct Tamil-site extractors. These run as their OWN Render service because a crawl is multi-hop and slow (20-40s), which the main sidecar's 18s fan-out deadline cannot afford, and because reachability depends on the region/ASN this runs in. Domains rotate every few weeks: add candidates rather than replacing, and the driver uses whichever answers. 1TamilMV dropped: magnets only (already covered by Torrentio) and it spent 13s of budget for nothing. Moviesda's ?q= search is ignored server-side, so it uses listingPaths + slug matching instead.",
   "sites": [
     {
       "name": "Moviesda",
@@ -13,12 +13,14 @@
       ],
       "searchPath": "/category.php?q={q}",
       "linkHosts": [
+        "cdnserver",
         "uploadg.com",
         "hubcloud",
         "hubdrive",
         "gdflix",
         "pixeldrain",
-        "r2.dev"
+        "r2.dev",
+        "cloudflarestorage"
       ],
       "crawlDepth": 3,
       "maxPages": 2,
@@ -26,7 +28,11 @@
       "types": [
         "movie",
         "series"
-      ]
+      ],
+      "listingPaths": [
+        "/category.php?c=tamil-latest-updates&page={page}"
+      ],
+      "listingPages": 3
     },
     {
       "name": "MovieRulz",
