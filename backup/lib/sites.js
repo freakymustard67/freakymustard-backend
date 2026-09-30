@@ -56,7 +56,14 @@ function titleMatches(candidate, want, year) {
   const c = norm(candidate);
   const w = norm(want);
   if (!c || !w) return false;
-  if (c.includes(w) || w.includes(c)) {
+
+  // Containment only counts when the shorter string is substantial. Without
+  // this, a one-letter candidate is a substring of almost any title: the
+  // /starting-with/L browse link ("L") matched the film "Leo" and the crawl
+  // then harvested that nav page's links.
+  const shorter = Math.min(c.length, w.length);
+  const exact = c === w;
+  if (exact || ((c.includes(w) || w.includes(c)) && shorter >= 4)) {
     if (!year || c.includes(String(year)) || !/\b(19|20)\d{2}\b/.test(c)) return true;
   }
   const wt = tokens(want);
