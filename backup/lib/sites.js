@@ -462,6 +462,9 @@ async function runSite(site, ctx, timeoutMs = 15000) {
     streams,
     ms: Date.now() - started,
     searched: searchUrl,
+    // Which film URLs the search matched. Without this, "found nothing" is
+    // indistinguishable from "matched the wrong page" when debugging a driver.
+    matched: posts.map((p) => p.url).slice(0, 5),
     error: streams.length ? undefined : 'no file-host links on matched pages',
   };
 }

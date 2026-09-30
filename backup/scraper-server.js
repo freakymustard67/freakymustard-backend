@@ -115,6 +115,8 @@ async function scrapeAll(ctx, perSiteTimeoutMs) {
           count: r.streams.length,
           ms: r.ms,
           error: r.error || null,
+          searched: r.searched || null,
+          matched: r.matched || null,
           at: Date.now()
         });
         return r.streams || [];
@@ -190,7 +192,10 @@ const server = http.createServer(async (req, res) => {
     }
 
     const out = await scrapeAll({ title, year, type, season, episode }, budget);
-    json(res, 200, { title, year, type, total: out.streams.length, streams: out.streams, ms: out.ms });
+    json(res, 200, {
+      title, year, type, total: out.streams.length, streams: out.streams, ms: out.ms,
+      sites: Object.fromEntries([...lastResult.entries()])
+    });
     return;
   }
 
