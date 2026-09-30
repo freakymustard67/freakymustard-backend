@@ -2,9 +2,18 @@
 
 Entry point is the ``gotopage.top`` landing page. It used to REDIRECT to the
 live mirror; it is now a static directory whose year links point at the
-current domain (moviesdatamil.co as of 2026-08). Every request still updates
+current domain (moviezda.net as of 2026-09). Every request still updates
 ``resolved_base`` from the final URL, so absolute links from the landing page
 and relative links deeper in the site both resolve correctly.
+
+The movie path self-heals through that landing page. The Tamil **web series**
+path (``get_series_list`` and below) does the same rather than trusting one
+hardcoded domain: the listing lives at ``SERIES_PATH`` on whichever mirror is
+alive, candidates are tried in order (last known-good → ``resolved_base`` →
+domains harvested from the directory → ``SERIES_SEED_BASES``), the winner is
+remembered, and the directory is re-read once before giving up. A mirror move
+therefore costs one failed hop, not the whole shelf — which is exactly what
+happened when ``moviesdatamil.co`` became a DNS-poisoned redirector.
 
 Levels:
   1 get_years         — year categories from the landing page
@@ -13,6 +22,12 @@ Levels:
   4 get_files         — file entries (drills through wrapper folders)
   5 get_servers       — download-server links on a file page
   6 resolve_final_link — follows server pages to the direct .mp4/.mkv
+
+Series levels reuse the same helpers:
+  get_series_list (mirror-resolved listing) → get_seasons (season folders +
+  poster/description) → get_episodes (aggregated over pagination, drilling the
+  per-quality folder when the season page is only a container) →
+  resolve_episode (first server that yields a direct stream).
 """
 
 import asyncio
