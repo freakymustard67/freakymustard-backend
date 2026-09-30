@@ -49,6 +49,12 @@ router = APIRouter(tags=["Backup streams (freaky-backup)"])
 BACKUP_ENGLISH = os.environ.get("BACKUP_ENGLISH", "http://127.0.0.1:8101").rstrip("/")
 BACKUP_TAMIL = os.environ.get("BACKUP_TAMIL", "http://127.0.0.1:8102").rstrip("/")
 
+# Direct site extractors run as their own service: a crawl is multi-hop and can
+# take 30s+, which the sidecar's 18s fan-out cannot afford, and reachability
+# depends on the region that service runs in. Empty = disabled.
+SCRAPER_BASE = os.environ.get("SCRAPER_BASE", "").rstrip("/")
+SCRAPER_BUDGET_MS = int(os.environ.get("SCRAPER_BUDGET_MS", "45000"))
+
 _IMDB_RE = re.compile(r"^tt\d{4,10}$")
 _CHUNK = 256 * 1024
 
@@ -339,34 +345,50 @@ async def backup_streams(
     query = f"/api/streams?type={type}&id={quote(upstream_id)}"
     if site_title:
         query += f"&title={quote(site_title)}&year={quote(site_year)}"
-    try:
-        _, data = await _fetch_json(_base_for(instance), query, request)
-    except HTTPException as exc:
+
+    # Both sources run concurrently: the scraper service is slower than the
+    # addon sidecar, and stacking them would double the page's wait.
+    sidecar_result, scraped = await asyncio.gather(
+        _fetch_json(_base_for(instance), query, request),
+        _scraper_streams(site_title, site_year, type, season, episode),
+        return_exceptions=True,
+    )
+    if isinstance(scraped, BaseException):
+        scraped = []
+
+    if isinstance(sidecar_result, BaseException):
+        exc = sidecar_result
+        data = {"streams": []}
         # On HF the sidecars aren't deployed (no 8101/8102) — don't 502 the page,
         # just return an empty backup set so the main servers keep working.
         # The frontend shows "No backup streams" without a noisy 502 toast.
-        return JSONResponse(
-            {
-                "provider": "freaky-backup",
-                "instance": instance,
-                "mediaType": media_type,
-                "sourceId": upstream_id,
-                "sources": [],
-                "torrents": [],
-                "meta": {
-                    "total": 0,
-                    "playable": 0,
-                    "maybe": 0,
-                    "downloadOnly": 0,
-                    "pages": 0,
-                    "torrent": 0,
-                    "error": str(getattr(exc, "detail", exc)),
-                    "unavailable": True,
-                },
-            }
-        )
+        # The addon sidecar is down. If the scraper service answered, serve
+        # those rows anyway rather than showing the user an empty panel.
+        if not scraped:
+            return JSONResponse(
+                {
+                    "provider": "freaky-backup",
+                    "instance": instance,
+                    "mediaType": media_type,
+                    "sourceId": upstream_id,
+                    "sources": [],
+                    "torrents": [],
+                    "meta": {
+                        "total": 0,
+                        "playable": 0,
+                        "maybe": 0,
+                        "downloadOnly": 0,
+                        "pages": 0,
+                        "torrent": 0,
+                        "error": str(getattr(exc, "detail", exc)),
+                        "unavailable": True,
+                    },
+                }
+            )
+    else:
+        _, data = sidecar_result
 
-    raw_streams = data.get("streams", [])
+    raw_streams = list(data.get("streams", [])) + list(scraped)
     base = _public_base(request)
 
     sources: list[dict] = []
@@ -480,6 +502,32 @@ async def backup_streams(
             "torrent": len(torrents),
         },
     }
+
+
+async def _scraper_streams(
+    title: str, year: str, type: str, season: int | None, episode: int | None
+) -> list[dict]:
+    """Fetch rows from the standalone direct-site scraper service."""
+    if not SCRAPER_BASE or not title:
+        return []
+    client = await _get_client()
+    params = {"title": title, "type": type, "budget": str(SCRAPER_BUDGET_MS)}
+    if year:
+        params["year"] = year
+    if type == "series":
+        params["season"] = str(season or 1)
+        params["episode"] = str(episode or 1)
+    try:
+        resp = await client.get(
+            f"{SCRAPER_BASE}/api/scrape",
+            params=params,
+            timeout=httpx.Timeout(SCRAPER_BUDGET_MS / 1000 + 20, connect=10.0),
+        )
+        if resp.status_code != 200:
+            return []
+        return (resp.json() or {}).get("streams", []) or []
+    except (httpx.HTTPError, ValueError):
+        return []
 
 
 def _ql(q: str) -> int:

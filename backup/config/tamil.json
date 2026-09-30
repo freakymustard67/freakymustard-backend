@@ -2,8 +2,8 @@
   "instance": "tamil",
   "displayName": "Freaky Backup \u00b7 Tamil",
   "addonId": "community.freakybackup.tamil",
-  "version": "1.2.0",
-  "description": "Backup stream resolver for Tamil & Indian movies/series. Aggregates HDHub, MediaFusion (1TamilMV / 1TamilBlasters / MovieRulz), Torrentio, DesiFlix, plus direct Tamil-site extractors (Moviesda, MovieRulz, Tamilgun). Standalone fallback for freaky mustard.",
+  "version": "1.3.0",
+  "description": "Backup stream resolver for Tamil & Indian movies/series. Aggregates HDHub, MediaFusion (1TamilMV / 1TamilBlasters / MovieRulz), Torrentio and DesiFlix. Direct site extractors run as a separate scraper service.",
   "accent": "#ff6b35",
   "accent2": "#ffd166",
   "port": 8102,
@@ -52,83 +52,6 @@
       "name": "DesiFlix",
       "tag": "DesiFlix",
       "baseUrl": "https://manifest.desitvhub.eu.org",
-      "types": [
-        "movie",
-        "series"
-      ],
-      "optional": true
-    },
-    {
-      "name": "Moviesda",
-      "tag": "MDsda",
-      "driver": "site",
-      "domains": [
-        "moviesda.garden",
-        "moviesda.net",
-        "moviezda.net"
-      ],
-      "searchPath": "/category.php?q={q}",
-      "linkHosts": [
-        "uploadg.com",
-        "hubcloud",
-        "hubdrive",
-        "gdflix",
-        "pixeldrain",
-        "r2.dev"
-      ],
-      "crawlDepth": 3,
-      "maxPages": 2,
-      "maxPagesPerDepth": 3,
-      "types": [
-        "movie",
-        "series"
-      ],
-      "optional": true
-    },
-    {
-      "name": "MovieRulz",
-      "tag": "MRulz",
-      "driver": "site",
-      "domains": [
-        "www.5movierulz2.cafe",
-        "5movierulz2.cafe"
-      ],
-      "searchPath": "/?s={q}",
-      "linkHosts": [
-        "hubcloud",
-        "hubdrive",
-        "gdflix",
-        "pixeldrain",
-        "r2.dev",
-        "googleusercontent"
-      ],
-      "crawlDepth": 2,
-      "maxPages": 2,
-      "maxPagesPerDepth": 3,
-      "types": [
-        "movie",
-        "series"
-      ],
-      "optional": true
-    },
-    {
-      "name": "Tamilgun",
-      "tag": "Tgun",
-      "driver": "site",
-      "domains": [
-        "tamilgun.at"
-      ],
-      "searchPath": "/?s={q}",
-      "linkHosts": [
-        "hubcloud",
-        "hubdrive",
-        "gdflix",
-        "pixeldrain",
-        "r2.dev"
-      ],
-      "crawlDepth": 2,
-      "maxPages": 2,
-      "maxPagesPerDepth": 3,
       "types": [
         "movie",
         "series"

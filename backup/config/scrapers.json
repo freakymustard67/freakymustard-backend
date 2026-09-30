@@ -1,0 +1,54 @@
+{
+  "version": "1.0.0",
+  "comment": "Direct Tamil-site extractors. These run as their OWN Render service because a crawl is multi-hop and slow (20-40s), which the main sidecar's 18s fan-out deadline cannot afford, and because reachability depends on the region/ASN this runs in. Domains rotate every few weeks: add candidates rather than replacing, and the driver uses whichever answers.",
+  "sites": [
+    {
+      "name": "Moviesda",
+      "tag": "MDsda",
+      "driver": "site",
+      "domains": ["moviesda.garden", "moviesda.net", "moviezda.net"],
+      "searchPath": "/category.php?q={q}",
+      "linkHosts": ["uploadg.com", "hubcloud", "hubdrive", "gdflix", "pixeldrain", "r2.dev"],
+      "crawlDepth": 3,
+      "maxPages": 2,
+      "maxPagesPerDepth": 3,
+      "types": ["movie", "series"]
+    },
+    {
+      "name": "MovieRulz",
+      "tag": "MRulz",
+      "driver": "site",
+      "domains": ["www.5movierulz2.cafe", "5movierulz2.cafe"],
+      "searchPath": "/?s={q}",
+      "linkHosts": ["hubcloud", "hubdrive", "gdflix", "pixeldrain", "r2.dev", "googleusercontent"],
+      "crawlDepth": 2,
+      "maxPages": 2,
+      "maxPagesPerDepth": 3,
+      "types": ["movie", "series"]
+    },
+    {
+      "name": "Tamilgun",
+      "tag": "Tgun",
+      "driver": "site",
+      "domains": ["tamilgun.at"],
+      "searchPath": "/?s={q}",
+      "linkHosts": ["hubcloud", "hubdrive", "gdflix", "pixeldrain", "r2.dev"],
+      "crawlDepth": 2,
+      "maxPages": 2,
+      "maxPagesPerDepth": 3,
+      "types": ["movie", "series"]
+    },
+    {
+      "name": "1TamilMV",
+      "tag": "TMV",
+      "driver": "site",
+      "domains": ["1tamilmv.lease", "1tamilmv.observer", "1tamilmv.meme", "1tamilmv.fi"],
+      "searchPath": "/index.php?/search/&q={q}",
+      "linkHosts": ["magnet:", "hubcloud", "hubdrive"],
+      "crawlDepth": 1,
+      "maxPages": 2,
+      "maxPagesPerDepth": 2,
+      "types": ["movie", "series"]
+    }
+  ]
+}
