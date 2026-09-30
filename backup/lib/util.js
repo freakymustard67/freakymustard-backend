@@ -62,6 +62,60 @@ function isSafeHttpUrl(u) {
 }
 
 /**
+ * Fetch an HTML/text page with a hard timeout, a size cap and browser-ish
+ * headers. Returns { ok, status, text, ms, url, error } — never throws.
+ *
+ * The Tamil sites in front of the download hosts are ordinary HTML pages, but
+ * several of them 403 a bare fetch, so we send a normal browser UA and accept
+ * language headers. We do NOT follow javascript: or non-http(s) redirects.
+ *
+ * @param {string} url
+ * @param {{timeoutMs?:number, maxBytes?:number, headers?:object, method?:string, body?:string, redirect?:string}} [opts]
+ */
+async function fetchText(url, opts = {}) {
+  const {
+    timeoutMs = 12000,
+    maxBytes = 900 * 1024,
+    headers = {},
+    method = 'GET',
+    body,
+    redirect = 'follow'
+  } = opts;
+  const started = Date.now();
+  if (!isSafeHttpUrl(url)) return { ok: false, status: 0, error: 'unsafe url', ms: 0 };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, {
+      method,
+      body,
+      signal: controller.signal,
+      redirect,
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-IN,en;q=0.9,ta;q=0.8',
+        ...headers
+      }
+    });
+    const ms = Date.now() - started;
+    const finalUrl = res.url || url;
+    if (!res.ok) return { ok: false, status: res.status, ms, url: finalUrl, error: `HTTP ${res.status}` };
+    const buf = Buffer.from(await res.arrayBuffer());
+    const text = buf.subarray(0, maxBytes).toString('utf8');
+    return { ok: true, status: res.status, ms, url: finalUrl, text, bytes: buf.length };
+  } catch (err) {
+    const ms = Date.now() - started;
+    const reason =
+      err && err.name === 'AbortError' ? `timeout after ${timeoutMs}ms` : String(err.message || err);
+    return { ok: false, status: 0, ms, error: reason };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
  * Validate a Stremio stream id for a given type and return a sanitized string
  * or null. Prevents path traversal / query injection into upstream URLs.
  *
@@ -103,4 +157,4 @@ function qualityScore(stream) {
   return score;
 }
 
-module.exports = { log, fetchJson, isSafeHttpUrl, validateId, qualityScore, UA };
+module.exports = { log, fetchJson, fetchText, isSafeHttpUrl, validateId, qualityScore, UA };

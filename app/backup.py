@@ -304,6 +304,8 @@ async def backup_streams(
     season: int | None = None,
     episode: int | None = None,
     instance: str = "english",
+    title: str = "",
+    year: str = "",
 ):
     """Return playable direct sources (+ torrents) from a freaky-backup upstream.
 
@@ -325,10 +327,20 @@ async def backup_streams(
         upstream_id = id
         media_type = "movie"
 
+    # Site extractors search by name, so pass one through. Callers that already
+    # know the title (the Tamil pages do) save a lookup; otherwise derive it.
+    site_title = (title or "").strip()
+    site_year = (year or "").strip()[:4]
+    if not site_title:
+        client = await _get_client()
+        site_title, derived_year = await _title_for(id, media_type, client)
+        site_year = site_year or derived_year
+
+    query = f"/api/streams?type={type}&id={quote(upstream_id)}"
+    if site_title:
+        query += f"&title={quote(site_title)}&year={quote(site_year)}"
     try:
-        _, data = await _fetch_json(
-            _base_for(instance), f"/api/streams?type={type}&id={quote(upstream_id)}", request
-        )
+        _, data = await _fetch_json(_base_for(instance), query, request)
     except HTTPException as exc:
         # On HF the sidecars aren't deployed (no 8101/8102) — don't 502 the page,
         # just return an empty backup set so the main servers keep working.
@@ -679,6 +691,26 @@ async def backup_probe(payload: ProbeRequest):
     return JSONResponse({"provider": "freaky-backup", "results": results})
 
 
+@router.get("/api/backup/resolve")
+async def backup_resolve(request: Request, url: str, instance: str = "english"):
+    """Resolve a file-host landing page into a direct file URL.
+
+    Done on demand rather than while listing: each resolution is a chain of
+    HTTP hops (gate page -> token -> interstitial -> presigned CDN link), so we
+    only pay for the row the user actually picked.
+    """
+    if not url.lower().startswith(("http://", "https://")):
+        raise HTTPException(400, "url must be http(s)")
+    base = _base_for(instance)
+    try:
+        _, data = await _fetch_json(base, f"/api/resolve?url={quote(url, safe='')}", request)
+    except HTTPException as exc:
+        return JSONResponse(
+            {"provider": "freaky-backup", "ok": False, "error": str(getattr(exc, "detail", exc))}
+        )
+    return JSONResponse({"provider": "freaky-backup", **data})
+
+
 # ---- Title -> IMDb id ------------------------------------------------------
 #
 # The Tamil catalogue is scraped pages with no IMDb id, but every backup addon
@@ -793,6 +825,38 @@ async def backup_imdb_lookup(title: str, year: str = "", type: str = "movie", re
 
 _IMDB_SUGGEST_HOSTS = ("https://v2.sg.media-imdb.com", "https://v3.sg.media-imdb.com")
 _VIDEO_TYPES = ("feature", "tv series", "tv mini-series", "tv movie", "video", "short")
+
+
+_TITLE_CACHE: dict[str, tuple[float, str, str]] = {}
+_TITLE_TTL = 3600.0
+
+
+async def _title_for(imdb_id: str, media_type: str, client: httpx.AsyncClient) -> tuple[str, str]:
+    """Resolve an IMDb id to (title, year).
+
+    Direct site extractors search by *name*, not by id, so the id has to be
+    turned back into a title before the sidecar can use them. Cached for an
+    hour; returns ("", "") on any failure so the addon path still runs.
+    """
+    from english import CINEMETA_BASE
+
+    hit = _TITLE_CACHE.get(imdb_id)
+    if hit and hit[0] > time.monotonic():
+        return hit[1], hit[2]
+    try:
+        resp = await client.get(f"{CINEMETA_BASE}/meta/{media_type}/{imdb_id}.json", timeout=10.0)
+        if resp.status_code != 200:
+            return "", ""
+        meta = (resp.json() or {}).get("meta") or {}
+        name = meta.get("name") or ""
+        year = str(meta.get("releaseInfo") or meta.get("year") or "")[:4]
+        _TITLE_CACHE[imdb_id] = (time.monotonic() + _TITLE_TTL, name, year)
+        if len(_TITLE_CACHE) > 500:
+            for k in list(_TITLE_CACHE)[:100]:
+                _TITLE_CACHE.pop(k, None)
+        return name, year
+    except (httpx.HTTPError, ValueError):
+        return "", ""
 
 
 async def _imdb_suggest(client: httpx.AsyncClient, name: str, year: str) -> list[dict]:

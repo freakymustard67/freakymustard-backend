@@ -11,7 +11,9 @@ const { URL } = require('url');
 const { TTLCache } = require('./cache');
 const { log, fetchJson, isSafeHttpUrl, validateId, qualityScore, UA } = require('./util');
 const { fetchStreams, fetchManifest } = require('./upstream');
+const { isSiteUpstream, probeSite } = require('./sites');
 const { aggregate } = require('./aggregator');
+const { resolveHost, hostKind } = require('./resolvers');
 const { landingPage } = require('./landing');
 
 function createApp(config) {
@@ -38,8 +40,8 @@ function createApp(config) {
   }
 
   // ---- core stream resolution ----------------------------------------------
-  async function resolveStreams(type, id) {
-    const key = `${type}:${id}`;
+  async function resolveStreams(type, id, ctx = {}) {
+    const key = `${type}:${id}:${(ctx.title || '').slice(0, 48)}`;
     const cached = cache.get(key);
     if (cached) {
       counters.cacheHits += 1;
@@ -68,12 +70,12 @@ function createApp(config) {
 
     const runOne = async (upstream) => {
       try {
-        let result = await fetchStreams(upstream, type, id, timeoutMs);
+        let result = await fetchStreams(upstream, type, id, timeoutMs, ctx);
         record(upstream, result);
         // one gentle retry on failure — but only while time budget remains
         if (!result.ok && !upstream.optional && Date.now() < startedAt + deadlineMs - 3000) {
           const left = startedAt + deadlineMs - Date.now();
-          result = await fetchStreams(upstream, type, id, Math.max(2000, Math.min(left - 1000, 25000)));
+          result = await fetchStreams(upstream, type, id, Math.max(2000, Math.min(left - 1000, 25000)), ctx);
           record(upstream, result);
         }
       } catch { /* recorded as absent */ } finally {
@@ -241,7 +243,7 @@ function createApp(config) {
           if (!id) { json(400, { error: 'invalid id', hint: 'expected tt1234567 or tt1234567:s:e (or tmdb:/dsf: ids)' }); return; }
 
           counters.streamRequests += 1;
-          const merged = await resolveStreams(type, id);
+          const merged = await resolveStreams(type, id, ctx);
           const streams = await decorateWithEngine(merged.streams, req);
           log(instance, `streams ${type}/${id} → ${streams.length} (${Date.now() - started}ms)`);
           json(200, { streams, ...(url.searchParams.has('debug') ? { sources: merged.sources } : {}) });
@@ -251,14 +253,31 @@ function createApp(config) {
         case pathname === '/api/streams': {
           const type = url.searchParams.get('type') || 'movie';
           const idRaw = url.searchParams.get('id') || '';
+          const ctx = {
+            title: (url.searchParams.get('title') || '').slice(0, 200),
+            year: (url.searchParams.get('year') || '').slice(0, 4)
+          };
           if (!['movie', 'series'].includes(type)) { json(400, { error: 'type must be movie|series' }); return; }
           const id = validateId(type, idRaw);
           if (!id) { json(400, { error: 'invalid id', hint: 'expected tt1234567 or tt1234567:s:e' }); return; }
           counters.streamRequests += 1;
-          const merged = await resolveStreams(type, id);
+          const merged = await resolveStreams(type, id, ctx);
           const streams = await decorateWithEngine(merged.streams, req);
           log(instance, `api ${type}/${id} → ${streams.length} (${Date.now() - started}ms)`);
           json(200, { query: { type, id }, total: streams.length, streams, sources: merged.sources });
+          break;
+        }
+
+        case pathname === '/api/resolve': {
+          // Turn a file-host landing page into a direct link, on demand. The
+          // list endpoint deliberately does not do this: each resolution is a
+          // chain of HTTP hops, so we only pay for the row the user picked.
+          const target = url.searchParams.get('url') || '';
+          if (!isSafeHttpUrl(target)) { json(400, { error: 'unsafe url' }); return; }
+          const startedResolve = Date.now();
+          const result = await resolveHost(target, { timeoutMs: 15000 });
+          log(instance, `resolve ${hostKind(target)} -> ${result.ok ? 'ok' : result.error} (${Date.now() - startedResolve}ms)`);
+          json(result.ok ? 200 : 502, result);
           break;
         }
 
@@ -286,6 +305,15 @@ function createApp(config) {
 
   async function probeUpstreams() {
     for (const u of cfg.upstreams) {
+      if (isSiteUpstream(u)) {
+        const r = await probeSite(u, 9000);
+        upstreamStatus.set(u.name, {
+          ok: Boolean(r.ok), count: null, ms: r.ms,
+          error: r.error || null, addonName: r.base || u.name, at: Date.now()
+        });
+        log(instance, `probe ${u.name}: ${r.ok ? `OK domain ${r.base}` : `FAIL ${r.error}`} (${r.ms}ms)`);
+        continue;
+      }
       const r = await fetchManifest(u, 8000);
       upstreamStatus.set(u.name, {
         ok: Boolean(r.ok),
