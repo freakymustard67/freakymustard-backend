@@ -67,6 +67,17 @@ function titleMatches(candidate, want, year) {
   return ratio >= 0.6 && yearOk;
 }
 
+/** Turn a URL path into something title-like: /movie/sardar-2-2026/ -> "sardar 2 2026". */
+function slugText(url) {
+  try {
+    const parts = new URL(url).pathname.split('/').filter(Boolean);
+    const last = parts[parts.length - 1] || '';
+    return decodeURIComponent(last).replace(/[-_+]+/g, ' ').replace(/\.(html?|php)$/i, '').trim();
+  } catch {
+    return '';
+  }
+}
+
 function yearOf(text) {
   const m = String(text || '').match(/\b(19|20)\d{2}\b/);
   return m ? m[0] : '';
@@ -180,11 +191,15 @@ function findPostLinks(html, base, want, year) {
     }
     if (!isSafeHttpUrl(href)) continue;
     if (new URL(href).origin !== new URL(base).origin) continue;
-    if (!text || text.length < 3) continue;
-    if (!titleMatches(text, want, year)) continue;
+    // Search results are very often bare poster links with no anchor text, so
+    // fall back to the slug — /movie/sardar-2-2026/ states the title and year.
+    const slug = slugText(href);
+    const haystack = text && text.length >= 3 ? text : slug;
+    if (!haystack) continue;
+    if (!titleMatches(haystack, want, year)) continue;
     if (seen.has(href)) continue;
     seen.add(href);
-    out.push({ url: href, text });
+    out.push({ url: href, text: text && text.length >= 3 ? text : slug });
     if (out.length >= 6) break;
   }
   return out;
@@ -344,4 +359,4 @@ async function probeSite(site, timeoutMs = 10000) {
   return { ok: Boolean(base), base, ms: Date.now() - started, error: base ? undefined : 'no live domain' };
 }
 
-module.exports = { runSite, isSiteUpstream, probeSite, findHostLinks, findPostLinks, titleMatches, crawlForLinks, interestingLinks };
+module.exports = { runSite, isSiteUpstream, probeSite, findHostLinks, findPostLinks, titleMatches, crawlForLinks, interestingLinks, slugText };
