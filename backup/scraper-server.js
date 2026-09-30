@@ -47,8 +47,46 @@ function loadSites() {
 }
 
 let SITES = loadSites();
+let INSPECT_FAMILIES = [];
+try {
+  const raw = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+  INSPECT_FAMILIES = raw.inspectFamilies || [];
+} catch {
+  INSPECT_FAMILIES = [];
+}
 const startedAt = Date.now();
 const lastResult = new Map(); // site name -> { ok, count, ms, error, at }
+
+/**
+ * Is this URL within a site family we already scrape?
+ *
+ * The inspect/probe helpers exist to keep drivers alive as these sites rotate
+ * their domains, so they must accept a *new* mirror of a site we already
+ * target — but nothing else, or they become an open proxy. Matching is on the
+ * family token (movierulz, tamilgun, ...) taken from the configured domains.
+ */
+function familyTokens() {
+  const toks = new Set();
+  for (const s of SITES) {
+    for (const d of s.domains || []) {
+      const host = String(d).replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+      const core = host.replace(/^www\./, '').split('.')[0];
+      if (core && core.length > 3) toks.add(core);
+    }
+  }
+  for (const t of INSPECT_FAMILIES) if (t) toks.add(String(t).toLowerCase());
+  return [...toks];
+}
+
+function inFamily(target) {
+  const lower = String(target).toLowerCase();
+  if (SITES.some((s) =>
+    [...(s.domains || []), ...(s.linkHosts || [])].some((n) =>
+      lower.includes(String(n).replace(/^https?:\/\//, '').replace(/\/.*$/, '').toLowerCase())
+    )
+  )) return true;
+  return familyTokens().some((t) => lower.includes(t));
+}
 
 function json(res, code, body) {
   const payload = JSON.stringify(body);
@@ -158,14 +196,8 @@ const server = http.createServer(async (req, res) => {
   // open proxy.
   if (url.pathname === '/api/inspect') {
     const target = url.searchParams.get('url') || '';
-    const allowed = SITES.some((s) =>
-      (s.domains || []).some((d) => {
-        const host = String(d).replace(/^https?:\/\//, '').replace(/\/.*$/, '');
-        return target.includes(host);
-      })
-    );
-    if (!allowed) {
-      json(res, 403, { error: 'host is not one of the configured sites' });
+    if (!inFamily(target)) {
+      json(res, 403, { error: 'host is not within a configured site family' });
       return;
     }
     const r = await fetchText(target, { timeoutMs: 25000, maxBytes: 300 * 1024 });
@@ -216,13 +248,8 @@ const server = http.createServer(async (req, res) => {
   // make us pull a whole film. Restricted to hosts the config already names.
   if (url.pathname === '/api/probe') {
     const target = url.searchParams.get('url') || '';
-    const named = SITES.some((s) =>
-      [...(s.domains || []), ...(s.linkHosts || [])].some((n) =>
-        target.includes(String(n).replace(/^https?:\/\//, '').replace(/\/.*$/, ''))
-      )
-    );
-    if (!named) {
-      json(res, 403, { error: 'host is not named by any configured site' });
+    if (!inFamily(target)) {
+      json(res, 403, { error: 'host is not within a configured site family' });
       return;
     }
     if (!/^https?:/i.test(target)) {

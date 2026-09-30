@@ -19,6 +19,7 @@ import asyncio
 import httpx
 from bs4 import BeautifulSoup
 from typing import Optional, List, Dict
+import time
 import urllib.parse
 import re
 
@@ -36,6 +37,33 @@ _FALLBACK_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
 }
+
+# --- series-path mirror resolution -------------------------------------------
+#
+# The series listing lives at a fixed PATH on whichever mirror currently
+# serves. The old code hardcoded the whole url (moviesdatamil.co), which is
+# now only a redirector — and one that is DNS-poisoned on many networks — so
+# the fetch raised and /api/series 500'd the shelf away. The domain is now
+# resolved at call time from the same live signal the movie path uses
+# (resolved_base / the directory page), with these seeds as the last resort.
+SERIES_PATH = "/tamil-web-series-download/"
+
+# Seeds, newest first. A future mirror move costs one failed hop instead of
+# an outage; the first domain that answers is remembered and reused.
+SERIES_SEED_BASES = (
+    "https://moviezda.net",
+    "https://moviesdatamil.me",
+    "https://moviezda.com",
+    "https://moviesdatamil.co",
+)
+
+SERIES_FETCH_TIMEOUT = 20.0  # per candidate: a dead mirror must fail fast
+MIRROR_DISCOVERY_TIMEOUT = 10.0
+MIRROR_DISCOVERY_TTL = 600.0  # don't re-read the directory on every request
+
+
+class SeriesListingUnavailable(RuntimeError):
+    """No known mirror served the series listing — upstream trouble, not a bug."""
 
 
 def path_key(link: str) -> str:
@@ -67,17 +95,21 @@ def canonical_page_url(url: str) -> str:
 
 
 class MoviesdaScraper:
-    SERIES_LIST_URL = "https://moviesdatamil.co/tamil-web-series-download/"
-
     def __init__(self):
         self.headers = dict(_FALLBACK_HEADERS)
         self.base_url = "https://gotopage.top/?ref=2026"  # Seed/directory URL
         self.client = httpx.AsyncClient(headers=self.headers, follow_redirects=True, timeout=30.0)
         self.resolved_base = None
+        self.series_base = None  # last domain that actually served the series listing
+        self.mirror_bases: List[str] = []  # live domains harvested from the directory
+        self._mirror_checked_at = 0.0
 
-    async def _get_soup(self, url: str) -> BeautifulSoup:
+    async def _get_soup(self, url: str, timeout: Optional[float] = None) -> BeautifulSoup:
         print(f"Fetching: {url}")
-        response = await self.client.get(url)
+        # ``timeout=None`` here means "client default"; httpx treats an
+        # explicit None as "no timeout", so only pass it when set.
+        kwargs = {} if timeout is None else {"timeout": timeout}
+        response = await self.client.get(url, **kwargs)
         response.raise_for_status()
         # Track the domain we actually landed on — the mirror moves often.
         final_url = str(response.url)
@@ -108,6 +140,9 @@ class MoviesdaScraper:
         if re.fullmatch(r"\d+", text):
             return True
         if text.lower() in ("home", "moviesda home"):
+            return True
+        # Pagination arrows ("»", "«", "›"…) render as blank, link-less tiles.
+        if text and not text.strip("«»‹›<>→←…").strip():
             return True
         return False
 
@@ -343,15 +378,126 @@ class MoviesdaScraper:
 
     # --- Tamil web series --------------------------------------------------------
 
+    @staticmethod
+    def _base_of(url: str) -> Optional[str]:
+        """``scheme://host`` of an absolute http(s) url, else None."""
+        p = urllib.parse.urlparse(url or "")
+        if p.scheme in ("http", "https") and p.netloc:
+            return f"{p.scheme}://{p.netloc}"
+        return None
+
+    async def _discover_mirror_bases(self, max_age: float = MIRROR_DISCOVERY_TTL) -> List[str]:
+        """Live serving domains, harvested from the directory landing page.
+
+        ``gotopage.top`` no longer serves the catalogue itself, but its links
+        are absolute urls on whichever domain does — the very signal the movie
+        path follows when it seeds ``resolved_base``. Reading it here (without
+        touching ``resolved_base``: the directory must never become the base
+        relative links resolve against) means a mirror move is absorbed
+        automatically instead of needing a code change.
+        """
+        now = time.monotonic()
+        if self.mirror_bases and now - self._mirror_checked_at < max_age:
+            return list(self.mirror_bases)
+        try:
+            response = await self.client.get(self.base_url, timeout=MIRROR_DISCOVERY_TIMEOUT)
+            response.raise_for_status()
+            soup = BeautifulSoup(response.text, "html.parser")
+        except Exception as e:  # noqa: BLE001 — discovery is best-effort
+            print(f"Mirror discovery failed: {type(e).__name__}: {e}")
+            return list(self.mirror_bases)
+
+        directory = self._base_of(self.base_url)
+        bases: List[str] = []
+        for a in soup.find_all("a", href=True):
+            base = self._base_of(a["href"])
+            if base and base != directory and base not in bases:
+                bases.append(base)
+        if bases:
+            self.mirror_bases = bases
+            self._mirror_checked_at = now
+            print(f"Mirror discovery: live domain(s) {bases}")
+        return list(self.mirror_bases)
+
+    async def _series_base_candidates(self, refresh: bool = False) -> List[str]:
+        """Ordered live-domain candidates for the series listing.
+
+        Last known-good first, then whatever domain the rest of the scraper
+        resolved, then the directory's current links, then the static seeds.
+        ``resolved_base`` is only *one* candidate: it is empty on a fresh
+        process and it can be the directory itself, neither of which is a
+        serving mirror.
+        """
+        directory = self._base_of(self.base_url)
+        discovered = await self._discover_mirror_bases(
+            0.0 if refresh else MIRROR_DISCOVERY_TTL
+        )
+        candidates: List[str] = []
+        for base in (self.series_base, self.resolved_base, *discovered, *SERIES_SEED_BASES):
+            if base and base != directory and base not in candidates:
+                candidates.append(base)
+        return candidates
+
+    @staticmethod
+    def _series_url(base: str, page: int) -> str:
+        url = f"{base.rstrip('/')}{SERIES_PATH}"
+        return url if page <= 1 else f"{url}?get-page={page}"
+
+    async def _series_listing_soup(self, page: int) -> BeautifulSoup:
+        """Fetch the series listing from whichever mirror currently answers.
+
+        Candidates are tried in order and the winner is remembered as
+        ``series_base`` (and as ``resolved_base``, since it demonstrably
+        serves the site). If every known domain fails the directory is
+        re-read once — a moved mirror shows up there before it shows up
+        anywhere else.
+        """
+        errors: List[str] = []
+        tried: set = set()
+
+        async def _try(bases: List[str]) -> Optional[BeautifulSoup]:
+            for base in bases:
+                if base in tried:
+                    continue
+                tried.add(base)
+                try:
+                    soup = await self._get_soup(
+                        self._series_url(base, page), timeout=SERIES_FETCH_TIMEOUT
+                    )
+                except Exception as e:  # noqa: BLE001 — try the next mirror
+                    errors.append(f"{base} ({type(e).__name__})")
+                    continue
+                self.series_base = base
+                self.resolved_base = base
+                return soup
+            return None
+
+        soup = await _try(await self._series_base_candidates())
+        if soup is None:
+            soup = await _try(await self._series_base_candidates(refresh=True))
+        if soup is None:
+            raise SeriesListingUnavailable(
+                "no mirror served the series listing; tried " + ", ".join(errors)
+            )
+        return soup
+
     async def get_series_list(self, page: int = 1) -> List[Dict[str, any]]:
-        """Series listing page (paginated with the site's ?get-page=N param)."""
-        url = self.SERIES_LIST_URL if page <= 1 else f"{self.SERIES_LIST_URL}?get-page={page}"
-        soup = await self._get_soup(url)
+        """Series listing page (paginated with the site's ?get-page=N param).
+
+        The domain is resolved dynamically (see ``_series_listing_soup``) so a
+        mirror move can no longer break the shelf; the emitted links are
+        relative on that page and resolve against the mirror that just served.
+        """
+        soup = await self._series_listing_soup(page)
         items, seen = [], set()
         for a in soup.find_all("a", href=True):
             href = a.get("href", "")
             text = a.get_text(strip=True)
             if "web-series" not in href or not text or self._is_nav_junk(text):
+                continue
+            # Pagination anchors point back at the listing path itself (the
+            # "»" next-page arrow reached the shelf as a posterless tile).
+            if "get-page=" in href:
                 continue
             link = await self._resolve_url(href)
             key = path_key(link)
@@ -373,11 +519,39 @@ class MoviesdaScraper:
                 seasons.append(item)
         return {"seasons": seasons, "episodes": episodes, "meta": data["meta"]}
 
-    async def get_episodes(self, season_url: str, pages: int = 10) -> List[Dict[str, any]]:
+    async def _episode_folders(self, page_url: str) -> List[str]:
+        """Sub-folders of a season page that may hold the episode files.
+
+        The mirror wraps a season in per-quality folders (season page →
+        1080p/720p folder → …-epi-NN files), so the season page itself has no
+        episode links. Highest quality first — but the caller only trusts a
+        folder that actually yields episodes.
+        """
+        try:
+            data = await self.get_qualities(page_url)
+        except Exception as e:  # noqa: BLE001 — detail lookup is best-effort
+            print(f"Season folder lookup failed: {e}")
+            return []
+        folders = [q["link"] for q in data.get("qualities", []) if q.get("link")]
+        priority = ("1080", "720", "480", "360", "original", "hd")
+        ordered: List[str] = []
+        for p in priority:
+            ordered += [f for f in folders if p in f.lower() and f not in ordered]
+        ordered += [f for f in folders if f not in ordered]
+        return ordered
+
+    async def get_episodes(
+        self, season_url: str, pages: int = 10, depth: int = 0
+    ) -> List[Dict[str, any]]:
         """Season page: episode links, aggregated over pagination.
 
         The site lists newest-first; results are returned oldest-first with a
         numeric ``episode`` field parsed from the /download/…-epi-N/ slug.
+
+        When the page handed in carries no episode links of its own it is a
+        quality container, not a season (what the current mirror serves); the
+        folders beneath it are then walked once, best quality first, so the
+        frontend's listing → seasons → episodes flow keeps working.
         """
         base = canonical_page_url(season_url)
         by_key = {}
@@ -410,6 +584,13 @@ class MoviesdaScraper:
             if found == 0:
                 break
             await asyncio.sleep(0.2)
+
+        if not by_key and depth == 0:
+            for folder in await self._episode_folders(base):
+                episodes = await self.get_episodes(folder, pages=pages, depth=depth + 1)
+                if episodes:
+                    return episodes
+
         episodes = list(by_key.values())
         episodes.sort(key=lambda e: (e["episode"] is None, e["episode"] or 0))
         return episodes

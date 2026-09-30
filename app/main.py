@@ -49,8 +49,8 @@ from signing import sign_url, verify_token
 from vidsrc import StreamResult, VidSrcError, resolve_movie, resolve_tv, UA
 from english import router as english_router
 from backup import router as backup_router
-from indexer import MovieIndexer
-from scraper import MoviesdaScraper
+from indexer import MovieIndexer, canonical_link
+from scraper import MoviesdaScraper, path_key
 
 VERSION = "3.0.0"
 logger = logging.getLogger("potato")
@@ -885,13 +885,51 @@ async def get_auto_stream(movie_url: str, request: Request):
 
 @app.get("/api/series")
 async def get_series(page: int = 1):
-    """Tamil web series listing (paginated)."""
+    """Tamil web series listing (paginated), enriched like the movie shelf.
+
+    Two fixes over the original: the listing is now enriched with
+    poster/description (cache first, one live detail scrape on a miss) so the
+    shelf renders artwork instead of blank placeholders, and an unreachable
+    upstream degrades to an explicit empty page instead of a 500 — the series
+    shelf failing must not take the rest of the Tamil catalogue down with it.
+    """
     try:
         results = await _content_scraper.get_series_list(page)
-        return {"page": page, "results": results, "has_more": len(results) > 0}
-    except Exception as e:  # noqa: BLE001
-        logger.exception("get_series failed")
-        raise HTTPException(status_code=500, detail="failed to fetch series")
+    except Exception as e:  # noqa: BLE001 — upstream, not a request error
+        logger.warning("get_series: listing unavailable: %s", e)
+        return {
+            "page": page,
+            "results": [],
+            "has_more": False,
+            "degraded": True,
+            "error": f"{type(e).__name__}: {e}"[:300],
+        }
+
+    degraded = False
+    try:
+        results = await _content_indexer.enrich_metadata(results)
+    except Exception as e:  # noqa: BLE001 — enrichment must never break the shelf
+        # Bare {title, link} items are still a usable shelf; say so instead of
+        # pretending the enrichment happened.
+        logger.warning("get_series: enrichment failed: %s", e)
+        degraded = True
+
+    # Re-pin to the mirror that just served the listing: enrichment can hand
+    # back a cached (or rebuilt) link on a domain that has since moved, and
+    # path keys are domain-independent, so the rewrite is lossless.
+    live_base = _content_scraper.series_base or _content_scraper.resolved_base
+    if live_base:
+        for item in results:
+            key = path_key(item.get("link"))
+            if key:
+                item["link"] = canonical_link(live_base, key)
+
+    return {
+        "page": page,
+        "results": results,
+        "has_more": len(results) > 0,
+        "degraded": degraded,
+    }
 
 
 @app.get("/api/seasons")
