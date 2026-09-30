@@ -191,15 +191,17 @@ function findPostLinks(html, base, want, year) {
     }
     if (!isSafeHttpUrl(href)) continue;
     if (new URL(href).origin !== new URL(base).origin) continue;
-    // Search results are very often bare poster links with no anchor text, so
-    // fall back to the slug — /movie/sardar-2-2026/ states the title and year.
+    // Match on the anchor text OR the slug, not one in place of the other.
+    // Listing rows are often bare posters, but just as often they all carry
+    // the same generic label ("Download Now"), in which case only the slug
+    // (/movie/charukesi-2026/) identifies the film.
     const slug = slugText(href);
-    const haystack = text && text.length >= 3 ? text : slug;
-    if (!haystack) continue;
-    if (!titleMatches(haystack, want, year)) continue;
+    const byText = text && text.length >= 3 && titleMatches(text, want, year);
+    const bySlug = slug && titleMatches(slug, want, year);
+    if (!byText && !bySlug) continue;
     if (seen.has(href)) continue;
     seen.add(href);
-    out.push({ url: href, text: text && text.length >= 3 ? text : slug });
+    out.push({ url: href, text: byText ? text : slug });
     if (out.length >= 6) break;
   }
   return out;
