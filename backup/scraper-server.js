@@ -26,7 +26,7 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 
-const { runSite, isSiteUpstream } = require('./lib/sites');
+const { runSite, isSiteUpstream, findMagnets } = require('./lib/sites');
 const { fetchText } = require('./lib/util');
 const { resolveHost } = require('./lib/resolvers');
 
@@ -236,9 +236,19 @@ const server = http.createServer(async (req, res) => {
         inputs
       });
     }
+    // Magnets are reported explicitly: they are a different shape from the
+    // anchor list (no http url), and they are easy to miss when a page is
+    // truncated at the anchor cap.
+    const magnets = findMagnets(r.text || '').map((m) => ({
+      infoHash: m.infoHash,
+      label: m.label.slice(0, 80),
+      trackers: (m.magnet.match(/[?&]tr=([^&]+)/g) || []).length
+    }));
+    const magnetAnchors = ((r.text || '').match(/href\s*=\s*["']magnet:/gi) || []).length;
     json(res, 200, {
       ok: r.ok, status: r.status, finalUrl: r.url, bytes: r.bytes,
-      error: r.error || null, title, forms, anchors
+      error: r.error || null, title, forms, anchors,
+      magnetAnchors, magnets
     });
     return;
   }
