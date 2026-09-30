@@ -179,9 +179,34 @@ const server = http.createServer(async (req, res) => {
         text: m[2].replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 70)
       });
     }
+    // Forms matter here: several of these sites search via a GET form whose
+    // action and input names are the only way to build the search URL.
+    const forms = [];
+    const fre = /<form\b([^>]*)>([\s\S]*?)<\/form>/gi;
+    let fm;
+    while ((fm = fre.exec(r.text || '')) && forms.length < 10) {
+      const attrs = fm[1] || '';
+      const inputs = [];
+      const ire = /<(?:input|select)\b([^>]*)>/gi;
+      let im;
+      while ((im = ire.exec(fm[2] || '')) && inputs.length < 12) {
+        const a = im[1] || '';
+        inputs.push({
+          name: ((a.match(/name\s*=\s*["']([^"']*)["']/i) || [])[1]) || '',
+          type: ((a.match(/type\s*=\s*["']([^"']*)["']/i) || [])[1]) || '',
+          id: ((a.match(/id\s*=\s*["']([^"']*)["']/i) || [])[1]) || ''
+        });
+      }
+      forms.push({
+        action: ((attrs.match(/action\s*=\s*["']([^"']*)["']/i) || [])[1]) || '',
+        method: ((attrs.match(/method\s*=\s*["']([^"']*)["']/i) || [])[1]) || 'get',
+        role: ((attrs.match(/role\s*=\s*["']([^"']*)["']/i) || [])[1]) || '',
+        inputs
+      });
+    }
     json(res, 200, {
       ok: r.ok, status: r.status, finalUrl: r.url, bytes: r.bytes,
-      error: r.error || null, title, anchors
+      error: r.error || null, title, forms, anchors
     });
     return;
   }
