@@ -50,7 +50,7 @@ from vidsrc import StreamResult, VidSrcError, resolve_movie, resolve_tv, UA
 from english import router as english_router
 from backup import router as backup_router
 from indexer import MovieIndexer, canonical_link
-from scraper import MoviesdaScraper, path_key
+from scraper import MoviesdaScraper, SERIES_SEED_BASES, path_key
 
 VERSION = "3.0.0"
 logger = logging.getLogger("potato")
@@ -253,6 +253,34 @@ def _file_download_url(upstream: str, filename: str, request: Request) -> str:
     base = _public_base(request)
     token = sign_url(upstream, ttl=HLS_TOKEN_TTL)
     return f"{base}/file/{token}?filename={quote(filename or 'video')}"
+
+
+def _pin_to_live_mirror(items: list[dict], scraper: MoviesdaScraper, live_base: str) -> list[dict]:
+    """Rewrite catalogue urls that point at an old mirror onto ``live_base``.
+
+    The cache can hand back a link — or a poster — on a domain that has since
+    moved, while ``live_base`` is the domain that just served this listing, so
+    that domain is the truth. Links go through the domain-independent path key
+    (lossless); a poster is only touched when it sits on a mirror we have
+    actually seen serving, so a third-party image host is left alone.
+    """
+    posters_rebaseable = {
+        b
+        for b in (scraper.resolved_base, *scraper.mirror_bases, *SERIES_SEED_BASES)
+        if b and b != live_base
+    }
+    for item in items:
+        key = path_key(item.get("link"))
+        if key:
+            item["link"] = canonical_link(live_base, key)
+        poster = item.get("poster")
+        if poster:
+            parsed = urlparse(poster)
+            if f"{parsed.scheme}://{parsed.netloc}" in posters_rebaseable:
+                item["poster"] = urljoin(
+                    live_base, parsed.path + (f"?{parsed.query}" if parsed.query else "")
+                )
+    return items
 
 
 # --- serialization ----------------------------------------------------------
@@ -914,15 +942,9 @@ async def get_series(page: int = 1):
         logger.warning("get_series: enrichment failed: %s", e)
         degraded = True
 
-    # Re-pin to the mirror that just served the listing: enrichment can hand
-    # back a cached (or rebuilt) link on a domain that has since moved, and
-    # path keys are domain-independent, so the rewrite is lossless.
     live_base = _content_scraper.series_base or _content_scraper.resolved_base
     if live_base:
-        for item in results:
-            key = path_key(item.get("link"))
-            if key:
-                item["link"] = canonical_link(live_base, key)
+        results = _pin_to_live_mirror(results, _content_scraper, live_base)
 
     return {
         "page": page,

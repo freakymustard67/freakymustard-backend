@@ -165,6 +165,40 @@ function findHostLinks(html, base, linkHosts) {
   return found;
 }
 
+/**
+ * Pull `magnet:` links out of a page.
+ *
+ * These are the torrent half of a site's offering: an infoHash plus display
+ * name and trackers. They cannot ride the normal URL path (the http(s) guard
+ * rejects the scheme), so they are returned separately and surfaced as
+ * Stremio-shaped `infoHash` entries — which the aggregator already knows how to
+ * hand to the torrent engine and to the frontend's magnet list.
+ */
+function findMagnets(html) {
+  const out = [];
+  const seen = new Set();
+  const re = /<a\b[^>]*href\s*=\s*["'](magnet:\?[^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+  let m;
+  while ((m = re.exec(html))) {
+    const url = m[1].replace(/&amp;/g, '&');
+    const ih = (url.match(/xt=urn:btih:([A-Za-z0-9]{32,40})/i) || [])[1];
+    if (!ih) continue;
+    const key = ih.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    let dn = '';
+    try {
+      dn = decodeURIComponent((url.match(/[?&]dn=([^&]+)/) || [])[1] || '').replace(/\+/g, ' ');
+    } catch {
+      dn = '';
+    }
+    const text = m[2].replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+    const around = html.slice(Math.max(0, m.index - 240), m.index + 240);
+    out.push({ infoHash: key, magnet: url, label: dn || text || 'torrent', context: around });
+  }
+  return out;
+}
+
 /** Pick the page links that are film pages rather than navigation. */
 function findPostLinks(html, base, want, year) {
   const out = [];
@@ -274,6 +308,9 @@ async function crawlForLinks(startUrl, base, opts) {
       for (const link of findHostLinks(page.text, here, linkHosts)) {
         if (!found.some((f) => f.url === link.url)) found.push({ ...link, depth });
       }
+      for (const mag of findMagnets(page.text)) {
+        if (!found.some((f) => f.infoHash === mag.infoHash)) found.push({ ...mag, depth });
+      }
       if (found.length) return found; // first depth that pays out wins
       if (depth === maxDepth) continue;
       for (const link of interestingLinks(page.text, here, origin)) {
@@ -346,8 +383,23 @@ async function runSite(site, ctx, timeoutMs = 15000) {
       maxPages: site.maxPagesPerDepth,
     });
     for (const link of links) {
-      if (seenUrl.has(link.url)) continue;
-      seenUrl.add(link.url);
+      const dedupe = link.url || `magnet:${link.infoHash}`;
+      if (seenUrl.has(dedupe)) continue;
+      seenUrl.add(dedupe);
+
+      if (link.infoHash && !link.url) {
+        const q = (link.context.match(/\b(2160p|4k|uhd|1080p|720p|480p)\b/i) || [])[1] || '';
+        streams.push({
+          name: `${site.tag || site.name} ${q || 'torrent'}`.trim(),
+          title: [link.label, q].filter(Boolean).join('\n'),
+          infoHash: link.infoHash,
+          sources: (link.magnet.match(/[?&]tr=([^&]+)/g) || []).map((t) =>
+            decodeURIComponent(t.replace(/^[?&]tr=/, ''))
+          ),
+          _site: site.name,
+        });
+        continue;
+      }
       const quality =
         (link.context.match(/\b(2160p|4k|uhd|1080p|720p|480p)\b/i) || [])[1] ||
         (post.text.match(/\b(2160p|4k|uhd|1080p|720p|480p)\b/i) || [])[1] ||
@@ -384,4 +436,4 @@ async function probeSite(site, timeoutMs = 10000) {
   return { ok: Boolean(base), base, ms: Date.now() - started, error: base ? undefined : 'no live domain' };
 }
 
-module.exports = { runSite, isSiteUpstream, probeSite, findHostLinks, findPostLinks, titleMatches, crawlForLinks, interestingLinks, slugText };
+module.exports = { runSite, isSiteUpstream, probeSite, findHostLinks, findMagnets, findPostLinks, titleMatches, crawlForLinks, interestingLinks, slugText };
