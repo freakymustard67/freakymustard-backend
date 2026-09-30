@@ -8,3 +8,6 @@ vidlink-ref/
 vidsrc-ref/
 vidlink-proxy-ref/
 cinepro-ref/
+
+# local virtualenvs
+.venv/

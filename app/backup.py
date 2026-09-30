@@ -32,6 +32,7 @@ recently returned to a real request.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import time
@@ -40,6 +41,7 @@ from urllib.parse import quote, urljoin, urlparse
 import httpx
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from pydantic import BaseModel, Field
 
 router = APIRouter(tags=["Backup streams (freaky-backup)"])
 
@@ -64,6 +66,35 @@ _EXT_FORMAT = {
     ".mkv": "mkv", ".mp4": "mp4", ".webm": "webm", ".m4v": "mp4",
     ".avi": "avi", ".mov": "mov", ".ts": "mp2t",
 }
+
+# --- playability classification --------------------------------------------
+# A backup source is only useful if a browser <video> can actually play it.
+# Three real-world shapes come out of the aggregators:
+#   native   — MP4/WebM H.264: plays inline, right now
+#   download — MKV/AVI/HEVC: a real video file the browser cannot decode
+#   page     — a file-host *landing page* (HTML), never a video: needs a
+#              host-specific resolver before it can play at all
+_NATIVE_CONTAINERS = {"mp4", "m4v", "webm"}
+_DOWNLOAD_CONTAINERS = {"mkv", "avi", "mov", "flv", "wmv", "mpg", "mpeg", "mp2t"}
+_ALL_CONTAINERS = _NATIVE_CONTAINERS | _DOWNLOAD_CONTAINERS | {"ts"}
+
+# Rank order used when sorting a title's backup sources.
+_PLAY_ORDER = {"native": 0, "unknown": 1, "download": 2, "page": 3}
+
+_HEVC_RE = re.compile(r"\b(x265|h\.?265|hevc|hvc1|dvh?|dolby\s*vision)\b", re.I)
+_H264_RE = re.compile(r"\b(x264|h\.?264|avc)\b", re.I)
+_SIZE_RE = re.compile(r"\b(\d+(?:\.\d+)?)\s*(GB|GiB|MB|MiB)\b", re.I)
+_SEED_RE = re.compile(r"(?:👤|👥|seeders?|peers?)\s*(\d+)", re.I)
+_PAGE_HOST_RE = re.compile(
+    r"(hubdrive|hubcloud|gdflix|filepress|drivebot|gdtot|filebee|sharer|"
+    r"hubstream|hdhub|vcloud|katfile|filevault|links?\.)",
+    re.I,
+)
+
+# Probe verdicts are cached — a page visit probes the same URLs repeatedly.
+_PROBE_CACHE: dict[str, tuple[float, dict]] = {}
+_PROBE_TTL = 300.0
+_probe_sem: asyncio.Semaphore | None = None
 
 _client: httpx.AsyncClient | None = None
 
@@ -115,6 +146,86 @@ async def _close_client() -> None:
 def _label(text: str) -> str:
     # strip the leading "[TAG] " that the aggregator prepends
     return re.sub(r"^\[[^\]]+\]\s*", "", (text or "").replace("\n", " · ")).strip()
+
+
+def _container_from(url: str, filename: str = "") -> str:
+    """Best-effort container guess from the filename, then the URL path."""
+    for candidate in (filename or "", urlparse(url or "").path or ""):
+        ext = os.path.splitext(candidate)[1].lower().lstrip(".")
+        if ext in _ALL_CONTAINERS:
+            return "mp2t" if ext == "ts" else ext
+    return ""
+
+
+def _quality_of(*texts: str) -> str:
+    """Quality from the most specific text first (filename > title > blob)."""
+    for text in texts:
+        for pattern, label in _QUALITY:
+            if pattern.search(text or ""):
+                return label
+    return ""
+
+
+def _size_of(text: str) -> str:
+    m = _SIZE_RE.search(text or "")
+    return f"{m.group(1)} {m.group(2).upper()}" if m else ""
+
+
+def _seeds_of(text: str) -> int:
+    m = _SEED_RE.search(text or "")
+    return int(m.group(1)) if m else 0
+
+
+def _classify(url: str, filename: str, blob: str) -> dict:
+    """Can a browser <video> play this inline? See the constants above."""
+    engine = bool(_ENGINE_URL_RE.search(url or ""))
+    container = _container_from(url, filename)
+    text = f"{filename or ''} {blob or ''}"
+    hevc = bool(_HEVC_RE.search(text))
+    h264 = bool(_H264_RE.search(text))
+
+    if container in _NATIVE_CONTAINERS:
+        if hevc:
+            return {
+                "container": container,
+                "codec": "hevc",
+                "playability": "download",
+                "note": "HEVC — only some players decode this",
+            }
+        return {
+            "container": container,
+            "codec": "h264" if h264 else "",
+            "playability": "native",
+            "note": "",
+        }
+
+    if container in _DOWNLOAD_CONTAINERS:
+        return {
+            "container": container,
+            "codec": "hevc" if hevc else ("h264" if h264 else ""),
+            "playability": "download",
+            "note": f"{container.upper()} — open in an external player",
+        }
+
+    if engine:
+        # Torrent engines give us the real filename only sometimes; most of
+        # what is left is MKV/HEVC, but we cannot know until playback starts.
+        return {
+            "container": "",
+            "codec": "hevc" if hevc else "",
+            "playability": "unknown",
+            "note": "container known only once playback starts",
+        }
+
+    if _PAGE_HOST_RE.search(url or ""):
+        return {
+            "container": "",
+            "codec": "",
+            "playability": "page",
+            "note": "file-host page — needs a host resolver",
+        }
+
+    return {"container": "", "codec": "", "playability": "unknown", "note": ""}
 
 
 def _forward_headers(request: Request | None) -> dict:
@@ -233,6 +344,9 @@ async def backup_streams(
                 "meta": {
                     "total": 0,
                     "playable": 0,
+                    "maybe": 0,
+                    "downloadOnly": 0,
+                    "pages": 0,
                     "torrent": 0,
                     "error": str(getattr(exc, "detail", exc)),
                     "unavailable": True,
@@ -245,62 +359,98 @@ async def backup_streams(
 
     sources: list[dict] = []
     torrents: list[dict] = []
+    seen: set[str] = set()
+
     for s in raw_streams:
         if not isinstance(s, dict):
             continue
         blob = f"{s.get('name','')} {s.get('title','')} {s.get('description','')}"
         url = s.get("url")
         info_hash = s.get("infoHash")
-        # For engine streams the upstream name is just "[TAG] ⚡direct" – use filename/title instead
-        raw_label = s.get("name") or s.get("title") or "Backup stream"
         filename_hint = (s.get("behaviorHints") or {}).get("filename") or ""
-        if url and _ENGINE_URL_RE.search(url):
-            # Prefer filename, then title's first line (before peers/size)
-            title_first = (s.get("title") or "").split("\n")[0].strip()
-            if filename_hint and filename_hint.lower() != "stream.mp4":
-                raw_label = filename_hint
-            elif title_first and "⚡direct" not in title_first:
-                raw_label = title_first
-            elif filename_hint:
-                raw_label = filename_hint
-        label = _label(raw_label)
+        title = s.get("title") or ""
+        # Aggregator titles are multi-line: filename / size / peers
+        title_first = title.split("\n")[0].strip()
 
         if url:
-            m = _ENGINE_URL_RE.search(url)
-            if m:
-                ih = m.group(1).lower()
-                idx = m.group(2) or "0"
+            engine_match = _ENGINE_URL_RE.search(url)
+            engine = bool(engine_match)
+
+            if engine:
+                # Engine rows carry a useless "[TAG] ⚡direct" name — the real
+                # filename is what tells the user (and us) what the file is.
+                if filename_hint and filename_hint.lower() != "stream.mp4":
+                    raw_label = filename_hint
+                elif title_first and "⚡direct" not in title_first:
+                    raw_label = title_first
+                else:
+                    raw_label = filename_hint or s.get("name") or "Backup stream"
+            else:
+                # External rows read like "[4KHDHub] 1080p" — the host tag is
+                # the only thing telling two similar rows apart, so keep it.
+                raw_label = s.get("name") or title_first or "Backup stream"
+            label = _label(raw_label)
+
+            if engine:
+                ih = engine_match.group(1).lower()
+                idx = engine_match.group(2) or "0"
                 name = quote(filename_hint or "stream.mp4")
                 # rewrite into a browser-reachable URL on this origin
                 out_url = f"{base}/backup/d/{ih}/{idx}/{name}"
-                kind = "engine"
+                dedupe_key = f"engine:{ih}:{idx}"
             else:
                 out_url = url
-                kind = "direct"
+                # same file served by several upstreams: collapse on the path
+                dedupe_key = f"url:{url.split('?')[0]}"
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+
+            meta = _classify(url, filename_hint, blob)
             sources.append(
                 {
                     "url": out_url,
                     "label": label,
-                    "format": _ext_format(url),
-                    "quality": _quality(blob),
-                    "engine": kind == "engine",
+                    "format": meta["container"] or _ext_format(url),
+                    "quality": _quality_of(filename_hint, title_first, label, blob),
+                    "size": _size_of(title),
+                    "seeds": _seeds_of(title),
+                    "engine": engine,
+                    "playability": meta["playability"],
+                    "container": meta["container"],
+                    "codec": meta["codec"],
+                    "note": meta["note"],
+                    "host": urlparse(url).netloc.lower(),
                 }
             )
         elif info_hash:
+            if info_hash in seen:
+                continue
+            seen.add(info_hash)
             # raw torrent entry (no url) — surface as a magnet for downloaders
             magnet = s.get("magnet") or f"magnet:?xt=urn:btih:{info_hash}"
             torrents.append(
                 {
-                    "name": label,
+                    "name": _label(s.get("name") or title_first) or "Torrent",
                     "magnet": magnet,
                     "infoHash": info_hash,
                     "fileIdx": s.get("fileIdx"),
-                    "quality": _quality(blob),
+                    "quality": _quality_of(title_first, blob),
+                    "size": _size_of(title),
+                    "seeds": _seeds_of(title),
                 }
             )
 
-    # Playable direct sources first (engines before externals), then best quality.
-    sources.sort(key=lambda x: (0 if x["engine"] else 1, -_ql(x["quality"])))
+    # Inline-playable first, then the unknown-but-worth-trying, then files that
+    # need an external player, then host pages (which cannot play as-is).
+    sources.sort(
+        key=lambda x: (
+            _PLAY_ORDER.get(x["playability"], 9),
+            -_ql(x["quality"]),
+            0 if x["engine"] else 1,
+            x["label"].lower(),
+        )
+    )
 
     return {
         "provider": "freaky-backup",
@@ -311,7 +461,10 @@ async def backup_streams(
         "torrents": torrents,
         "meta": {
             "total": len(sources) + len(torrents),
-            "playable": len(sources),
+            "playable": sum(1 for x in sources if x["playability"] == "native"),
+            "maybe": sum(1 for x in sources if x["playability"] == "unknown"),
+            "downloadOnly": sum(1 for x in sources if x["playability"] == "download"),
+            "pages": sum(1 for x in sources if x["playability"] == "page"),
             "torrent": len(torrents),
         },
     }
@@ -387,6 +540,335 @@ async def backup_engine_file(
             await resp.aclose()
 
     return StreamingResponse(streamer(), status_code=resp.status_code, headers=passthrough)
+
+
+# ---- Server-side reachability probe ----------------------------------------
+#
+# Why this exists: the browser cannot verify an external backup URL. A
+# cross-origin HEAD without CORS headers rejects as an opaque TypeError, and
+# the old client-side filter counted those as "working" — so every row claimed
+# to be alive and almost every click failed. Probing here is same-origin (no
+# CORS), and Content-Type separates a real video from a file-host HTML page.
+
+_PROBE_CONCURRENCY = 10
+_PROBE_MAX = 40
+_PROBE_TIMEOUT = 7.0
+
+# Content types that are video but that a browser <video> cannot decode.
+_UNPLAYABLE_CONTENT_TYPES = (
+    "matroska", "x-msvideo", "x-ms-wmv", "quicktime", "mp2t", "mpeg-ts",
+)
+
+
+class ProbeItem(BaseModel):
+    key: str
+    url: str
+    engine: bool = False
+    # Optional filename/label hint. Some CDNs (Cloudflare R2 presigned links in
+    # particular) serve every object as application/octet-stream, so the
+    # extension is the only thing that reveals whether it is an MP4 or an MKV.
+    hint: str = ""
+
+
+class ProbeRequest(BaseModel):
+    items: list[ProbeItem] = Field(default_factory=list)
+
+
+def _verdict_from(resp, hint: str = "") -> dict:
+    ct = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
+    size = resp.headers.get("content-length") or ""
+    status = resp.status_code
+    if status >= 400:
+        return {"status": "dead", "http": status, "contentType": ct, "size": size, "playable": False, "note": f"HTTP {status}"}
+    if ct.startswith("video/"):
+        # Browsers only reliably decode MP4/H.264 and WebM. Everything else
+        # (matroska, AVI, QuickTime, raw MPEG-TS) is a real video file that
+        # still needs an external player, so it must not be advertised as
+        # click-to-play.
+        playable = not any(bad in ct for bad in _UNPLAYABLE_CONTENT_TYPES)
+        return {
+            "status": "ok",
+            "http": status,
+            "contentType": ct,
+            "size": size,
+            "playable": playable,
+            "note": "" if playable else f"{ct} needs an external player",
+        }
+    if ct in ("application/octet-stream", "binary/octet-stream", "application/x-matroska"):
+        # Opaque type: fall back to the filename the aggregator gave us.
+        container = _container_from(resp.headers.get("content-disposition", ""), hint)
+        if container in _NATIVE_CONTAINERS:
+            return {
+                "status": "ok",
+                "http": status,
+                "contentType": ct,
+                "size": size,
+                "playable": True,
+                "note": f"served as {ct} but is {container.upper()}",
+            }
+        return {
+            "status": "ok",
+            "http": status,
+            "contentType": ct,
+            "size": size,
+            "playable": False,
+            "note": f"opaque file — treat as {container.upper() or 'MKV'}",
+        }
+    if ct.startswith("text/html"):
+        return {"status": "page", "http": status, "contentType": ct, "size": size, "playable": False, "note": "HTML page, not a video"}
+    if ct.startswith("application/json") or ct.startswith("text/plain"):
+        return {"status": "page", "http": status, "contentType": ct, "size": size, "playable": False, "note": "not a video file"}
+    return {"status": "ok", "http": status, "contentType": ct, "size": size, "playable": False, "note": ""}
+
+
+async def _probe_url(client: httpx.AsyncClient, url: str, hint: str = "") -> dict:
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; FreakyMustard/1.0)", "Accept": "*/*"}
+    try:
+        resp = await client.head(url, headers=headers, follow_redirects=True, timeout=_PROBE_TIMEOUT)
+        if resp.status_code < 400:
+            return _verdict_from(resp, hint)
+    except httpx.HTTPError:
+        pass
+    # Many file hosts reject HEAD (403/405/501) — Cloudflare R2 presigned links
+    # are signed for GET only. Retry as a 2-byte ranged GET, streamed and never
+    # read, so a host that ignores Range cannot make us download the whole file.
+    try:
+        req = client.build_request("GET", url, headers={**headers, "Range": "bytes=0-1"})
+        resp = await client.send(req, stream=True)
+        try:
+            return _verdict_from(resp, hint)
+        finally:
+            await resp.aclose()
+    except httpx.HTTPError as exc:
+        return {"status": "dead", "playable": False, "note": str(exc)[:120]}
+
+
+@router.post("/api/backup/probe")
+async def backup_probe(payload: ProbeRequest):
+    """Check which backup sources actually resolve to playable video."""
+    global _probe_sem
+    if _probe_sem is None:
+        _probe_sem = asyncio.Semaphore(_PROBE_CONCURRENCY)
+    client = await _get_client()
+    items = payload.items[:_PROBE_MAX]
+
+    async def run(item: ProbeItem):
+        if item.engine:
+            # Engine rows are streamed from the sidecar's torrent engine.
+            # Probing one would start a torrent transfer, so don't.
+            return item.key, {"status": "engine", "playable": True, "note": "starts on play"}
+        now = time.monotonic()
+        hit = _PROBE_CACHE.get(item.url)
+        if hit and hit[0] > now:
+            return item.key, hit[1]
+        async with _probe_sem:
+            verdict = await _probe_url(client, item.url, item.hint)
+        _PROBE_CACHE[item.url] = (now + _PROBE_TTL, verdict)
+        if len(_PROBE_CACHE) > 400:
+            for k in list(_PROBE_CACHE)[:100]:
+                _PROBE_CACHE.pop(k, None)
+        return item.key, verdict
+
+    pairs = await asyncio.gather(*(run(i) for i in items), return_exceptions=True)
+    results: dict[str, dict] = {}
+    for pair in pairs:
+        if isinstance(pair, BaseException):
+            continue
+        key, verdict = pair
+        results[key] = verdict
+    return JSONResponse({"provider": "freaky-backup", "results": results})
+
+
+# ---- Title -> IMDb id ------------------------------------------------------
+#
+# The Tamil catalogue is scraped pages with no IMDb id, but every backup addon
+# (Torrentio, MediaFusion, DesiFlix) is keyed by IMDb id. Without this lookup
+# the Tamil backup instance can never find anything.
+
+_IMDB_CACHE: dict[str, tuple[float, dict]] = {}
+_IMDB_TTL = 3600.0
+
+# Scraped titles carry an enriched blob after the year:
+#   "Hunkkaar The Roar (2026)7.8Cast:Devendra Patel...Genres:Crime, Thriller"
+_META_BLOB_RE = re.compile(r"^(.*?\(\d{4}\))", re.S)
+
+
+def _clean_scraped_title(raw: str) -> tuple[str, str]:
+    """'Hunkkaar The Roar (2026)7.8Cast:…' -> ('Hunkkaar The Roar', '2026')."""
+    text = (raw or "").strip()
+    m = _META_BLOB_RE.match(text)
+    if m:
+        text = m.group(1)
+    year = ""
+    ym = re.search(r"\((\d{4})\)", text)
+    if ym:
+        year = ym.group(1)
+        text = text.replace(ym.group(0), " ")
+    text = re.sub(r"\s+", " ", text).strip(" -–—:.")
+    return text, year
+
+
+def _score_meta(meta: dict, name: str, year: str) -> int:
+    cand = (meta.get("name") or "").strip().lower()
+    want = name.lower()
+    score = 0
+    if cand == want:
+        score += 5
+    elif want and (want in cand or cand in want):
+        score += 3
+    elif want and _tokens_overlap(want, cand):
+        score += 2
+    cand_year = str(meta.get("releaseInfo") or meta.get("year") or "")[:4]
+    if year and cand_year == year:
+        score += 4
+    elif year and cand_year.isdigit() and abs(int(cand_year) - int(year)) <= 1:
+        score += 2
+    if not (meta.get("imdb_id") or "").startswith("tt"):
+        score -= 10
+    return score
+
+
+def _tokens_overlap(a: str, b: str) -> bool:
+    ta = {t for t in re.split(r"\W+", a) if len(t) > 2}
+    tb = {t for t in re.split(r"\W+", b) if len(t) > 2}
+    return bool(ta & tb)
+
+
+@router.get("/api/backup/imdb")
+async def backup_imdb_lookup(title: str, year: str = "", type: str = "movie", region: str = ""):
+    """Resolve a scraped title to an IMDb id so Tamil backups can be queried.
+
+    Cinemeta's own search is useless for this: its catalogs are popularity-
+    ranked and mostly Western, and the Tamil "Leo (2023)" does not appear for
+    the query "leo" at all. IMDb's suggestion endpoint covers the whole of
+    IMDb, and appending the year is what pulls regional titles up — "leo 2023"
+    returns both Adam Sandler's Leo and Vijay's.
+
+    Because name+year can still tie across regions, the Tamil pages pass
+    region=in: tied candidates are then resolved through Cinemeta metadata and
+    the Indian production wins.
+    """
+    from english import CINEMETA_BASE  # same directory, keeps the base in one place
+
+    name, parsed_year = _clean_scraped_title(title)
+    yr = (year or parsed_year or "").strip()[:4]
+    if len(name) < 2:
+        raise HTTPException(400, "title is too short to search")
+
+    media = "series" if type == "series" else "movie"
+    cache_key = f"{media}|{name.lower()}|{yr}|{region}"
+    hit = _IMDB_CACHE.get(cache_key)
+    if hit and hit[0] > time.monotonic():
+        return JSONResponse(hit[1])
+
+    client = await _get_client()
+    candidates = await _imdb_suggest(client, name, yr)
+    if not candidates:
+        raise HTTPException(404, f"no IMDb match for '{name}'")
+
+    ranked = sorted(
+        candidates, key=lambda c: _score_suggestion(c, name, yr), reverse=True
+    )[:3]
+    best = ranked[0]
+
+    # Regional tiebreak: several films can share a name and year.
+    if region.lower() in ("in", "india") and len(ranked) > 1:
+        best = await _prefer_indian(client, ranked, name, yr)
+
+    result = {
+        "imdbId": best.get("id"),
+        "name": best.get("l"),
+        "year": str(best.get("y") or ""),
+        "cast": best.get("s"),
+        "score": _score_suggestion(best, name, yr),
+        "query": f"{name} {yr}".strip(),
+        "source": "imdb-suggest",
+    }
+    _IMDB_CACHE[cache_key] = (time.monotonic() + _IMDB_TTL, result)
+    if len(_IMDB_CACHE) > 500:
+        for k in list(_IMDB_CACHE)[:100]:
+            _IMDB_CACHE.pop(k, None)
+    return JSONResponse(result)
+
+
+_IMDB_SUGGEST_HOSTS = ("https://v2.sg.media-imdb.com", "https://v3.sg.media-imdb.com")
+_VIDEO_TYPES = ("feature", "tv series", "tv mini-series", "tv movie", "video", "short")
+
+
+async def _imdb_suggest(client: httpx.AsyncClient, name: str, year: str) -> list[dict]:
+    """Query IMDb autocomplete, year-first (that is what surfaces regional titles)."""
+    from urllib.parse import quote as _q
+
+    seen: dict[str, dict] = {}
+    queries = [f"{name} {year}".strip(), name]
+    for query in queries:
+        q = query.lower()
+        path = f"/suggestion/{_q(q[0])}/{_q(q.replace(' ', '_'))}.json"
+        for host in _IMDB_SUGGEST_HOSTS:
+            try:
+                resp = await client.get(
+                    f"{host}{path}",
+                    headers={"User-Agent": "Mozilla/5.0 (compatible; FreakyMustard/1.0)"},
+                    timeout=10.0,
+                )
+                if resp.status_code != 200:
+                    continue
+                for item in (resp.json() or {}).get("d", []) or []:
+                    iid = item.get("id") or ""
+                    if not iid.startswith("tt"):
+                        continue
+                    if (item.get("q") or "").lower() not in _VIDEO_TYPES:
+                        continue
+                    seen.setdefault(iid, item)
+                break
+            except (httpx.HTTPError, ValueError):
+                continue
+        if seen:
+            break
+    return list(seen.values())
+
+
+def _score_suggestion(item: dict, name: str, year: str) -> int:
+    cand = (item.get("l") or "").strip().lower()
+    want = name.lower()
+    score = 0
+    if cand == want:
+        score += 5
+    elif want and (want in cand or cand in want):
+        score += 3
+    elif want and _tokens_overlap(want, cand):
+        score += 2
+    cand_year = str(item.get("y") or "")[:4]
+    if year and cand_year == year:
+        score += 4
+    elif year and cand_year.isdigit() and abs(int(cand_year) - int(year)) <= 1:
+        score += 2
+    if (item.get("q") or "").lower() != "feature":
+        score -= 1
+    return score
+
+
+async def _prefer_indian(
+    client: httpx.AsyncClient, ranked: list[dict], name: str, year: str
+) -> dict:
+    """Of near-tied candidates, return the one produced in India (if any)."""
+    from english import CINEMETA_BASE
+
+    top_score = _score_suggestion(ranked[0], name, year)
+    tied = [c for c in ranked if _score_suggestion(c, name, year) >= top_score - 4]
+    for cand in tied:
+        try:
+            resp = await client.get(
+                f"{CINEMETA_BASE}/meta/movie/{cand['id']}.json", timeout=8.0
+            )
+            if resp.status_code != 200:
+                continue
+            country = str(((resp.json() or {}).get("meta") or {}).get("country") or "")
+            if "india" in country.lower():
+                return cand
+        except (httpx.HTTPError, ValueError):
+            continue
+    return ranked[0]
 
 
 # ---- Health ----------------------------------------------------------------
