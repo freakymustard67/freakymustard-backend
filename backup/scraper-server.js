@@ -211,6 +211,53 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Verify a scraped link really is a playable file, from the region that can
+  // reach it. Streamed and never read, so a host that ignores Range cannot
+  // make us pull a whole film. Restricted to hosts the config already names.
+  if (url.pathname === '/api/probe') {
+    const target = url.searchParams.get('url') || '';
+    const named = SITES.some((s) =>
+      [...(s.domains || []), ...(s.linkHosts || [])].some((n) =>
+        target.includes(String(n).replace(/^https?:\/\//, '').replace(/\/.*$/, ''))
+      )
+    );
+    if (!named) {
+      json(res, 403, { error: 'host is not named by any configured site' });
+      return;
+    }
+    if (!/^https?:/i.test(target)) {
+      json(res, 400, { error: 'url must be http(s)' });
+      return;
+    }
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 20000);
+      const resp = await fetch(target, {
+        headers: { Range: 'bytes=0-2047', 'User-Agent': 'Mozilla/5.0' },
+        signal: ctrl.signal
+      });
+      clearTimeout(timer);
+      const ct = (resp.headers.get('content-type') || '').split(';')[0];
+      const out = {
+        status: resp.status,
+        contentType: ct,
+        contentRange: resp.headers.get('content-range'),
+        contentLength: resp.headers.get('content-length'),
+        acceptRanges: resp.headers.get('accept-ranges'),
+        disposition: (resp.headers.get('content-disposition') || '').slice(0, 120)
+      };
+      try {
+        await resp.body?.cancel();
+      } catch {
+        /* nothing to release */
+      }
+      json(res, 200, out);
+    } catch (err) {
+      json(res, 200, { status: 0, error: String(err.message || err) });
+    }
+    return;
+  }
+
   if (url.pathname === '/api/resolve') {
     const target = url.searchParams.get('url') || '';
     const result = await resolveHost(target, { timeoutMs: 20000 });
@@ -218,7 +265,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  json(res, 404, { error: 'not found', endpoints: ['/health', '/api/scrape', '/api/resolve', '/api/inspect'] });
+  json(res, 404, { error: 'not found', endpoints: ['/health', '/api/scrape', '/api/resolve', '/api/inspect', '/api/probe'] });
 });
 
 server.listen(PORT, '0.0.0.0', () => {
