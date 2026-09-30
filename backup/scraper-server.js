@@ -132,11 +132,14 @@ async function scrapeAll(ctx, perSiteTimeoutMs) {
   );
 
   // De-duplicate across sites: two sites often carry the same host link.
+  // A torrent has no `url` (it is an infoHash), so it needs its own key —
+  // keying on url alone silently drops every magnet here, after the driver has
+  // already found it.
   const seen = new Set();
   const streams = [];
   for (const list of results) {
     for (const s of list) {
-      const key = (s.url || '').split('?')[0];
+      const key = s.url ? s.url.split('?')[0] : s.infoHash ? `magnet:${s.infoHash}` : '';
       if (!key || seen.has(key)) continue;
       seen.add(key);
       streams.push(s);
