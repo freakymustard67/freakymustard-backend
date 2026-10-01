@@ -51,6 +51,27 @@ function classify(embedUrl) {
   return { id: 'unknown', kind: 'scan' };
 }
 
+/** Absolute iframe targets on a page (the wrapper players are just an iframe). */
+function findIframes(html, base) {
+  const out = [];
+  const re = /<iframe\b[^>]*src\s*=\s*["']([^"']+)["']/gi;
+  let m;
+  while ((m = re.exec(html))) {
+    let src = m[1].replace(/&amp;/g, '&').trim();
+    if (!src || /^(about:|javascript:|data:)/i.test(src)) continue;
+    if (src.startsWith('//')) src = `https:${src}`;
+    else if (!/^https?:/i.test(src)) {
+      try {
+        src = new URL(src, base).toString();
+      } catch {
+        continue;
+      }
+    }
+    if (!out.includes(src)) out.push(src);
+  }
+  return out;
+}
+
 /** Prefer an HLS master over a media file, and a master over a variant. */
 function hlsScore(u) {
   let score = 0;
@@ -140,30 +161,49 @@ async function extractMedia(embedUrl, opts = {}) {
       return { ...res, host: host.id, headers };
     }
 
-    const page = await fetchText(embedUrl, { timeoutMs, headers });
-    if (!page.ok) return { ok: false, host: host.id, error: `embed page: ${page.error}` };
+    // Wrapper players (the site's own /waaw/?l=…, and several hosts) are just a
+    // shell around an iframe pointing at the real player, so follow one level.
+    let current = embedUrl;
+    let referer = opts.referer || '';
+    for (let depth = 0; depth < 3; depth += 1) {
+      // eslint-disable-next-line no-await-in-loop
+      const page = await fetchText(current, {
+        timeoutMs,
+        headers: referer ? { ...headers, Referer: referer } : headers,
+      });
+      if (!page.ok) return { ok: false, host: host.id, error: `embed page: ${page.error} (${current.slice(0, 60)})` };
 
-    const { urls, usedUnpack } = extractMediaUrls(page.text);
-    const best = pickBest(urls);
-    if (best) {
-      return {
-        ok: true,
-        ...best,
-        host: host.id,
-        headers,
-        evidence: usedUnpack ? 'unpacked packed config' : 'media url in page',
-      };
+      const { urls, usedUnpack, unpacked } = extractMediaUrls(page.text);
+      const best = pickBest(urls);
+      if (best) {
+        return {
+          ok: true,
+          ...best,
+          host: host.id,
+          headers,
+          evidence: usedUnpack ? `unpacked packed config at depth ${depth}` : `media url in page at depth ${depth}`,
+          via: current,
+        };
+      }
+
+      const frames = findIframes(page.text, page.url || current).filter((f) => f !== current);
+      if (!frames.length) {
+        return {
+          ok: false,
+          host: host.id,
+          error: usedUnpack
+            ? 'unpacked the config but it held no media url'
+            : 'no media url found (nothing packed either)',
+          unpackedSample: usedUnpack ? String(unpacked).replace(/\s+/g, ' ').slice(0, 400) : undefined,
+        };
+      }
+      referer = page.url || current;
+      current = frames[0];
     }
-    return {
-      ok: false,
-      host: host.id,
-      error: usedUnpack
-        ? 'unpacked the config but it held no media url'
-        : 'no media url found (nothing packed either)',
-    };
+    return { ok: false, host: host.id, error: 'followed iframes but never reached a media url' };
   } catch (err) {
     return { ok: false, host: host.id, error: String((err && err.message) || err).slice(0, 160) };
   }
 }
 
-module.exports = { extractMedia, classify, pickBest, hlsScore, HOSTS };
+module.exports = { extractMedia, classify, pickBest, hlsScore, findIframes, HOSTS };
