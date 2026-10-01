@@ -112,9 +112,10 @@ async function extractNetu(embedUrl, ctx) {
   }
 
   const id =
-    (embedUrl.match(/\/e\/([A-Za-z0-9_-]+)/) || [])[1] ||
-    (page.text.match(/og:url["'][^>]*\/f\/([A-Za-z0-9_-]+)/i) || [])[1] ||
-    (page.text.match(/[?&]id=([A-Za-z0-9_-]{6,})/) || [])[1];
+    (embedUrl.match(/\/e\/([A-Za-z0-9_=-]+)/) || [])[1] ||
+    (page.text.match(/videokeyorig\s*=\s*["']([A-Za-z0-9_=-]+)["']/i) || [])[1] ||
+    (page.text.match(/og:url["'][^>]*\/f\/([A-Za-z0-9_=-]+)/i) || [])[1] ||
+    (page.text.match(/[?&]id=([A-Za-z0-9_=-]{6,})/) || [])[1];
   if (!id) return { ok: false, error: 'netu: no media id found' };
 
   // The player loads /dl?op=…&id=…&f=… style endpoints; try the documented
@@ -129,7 +130,9 @@ async function extractNetu(embedUrl, ctx) {
     // eslint-disable-next-line no-await-in-loop
     const res = await fetchText(url, { timeoutMs: ctx.timeoutMs, headers: { ...ctx.headers, Referer: embedUrl } });
     if (!res.ok) continue;
-    const found = pickBest(extractMediaUrls(res.text).urls);
+    const scan2 = extractMediaUrls(res.text);
+    if (scan2.fromCommentsOnly) continue; // a template, not a stream
+    const found = pickBest(scan2.urls);
     if (found) return { ok: true, ...found, evidence: `netu: ${url}` };
   }
   return { ok: false, error: 'netu: id found but no media url returned (needs its JS handshake)' };
