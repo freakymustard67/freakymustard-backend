@@ -349,6 +349,14 @@ async def backup_streams(
     # know the title (the Tamil pages do) save a lookup; otherwise derive it.
     site_title = (title or "").strip()
     site_year = (year or "").strip()[:4]
+    if site_title:
+        # Callers pass scraped titles, which carry the year and often the whole
+        # metadata blob ("Madharaasi (2025)8.1Cast:..."). Site search is literal
+        # - MovieRulz returns nothing for "Madharaasi (2025)" but finds
+        # "Madharaasi" - so strip it back to the film name.
+        cleaned, parsed_year = _clean_scraped_title(site_title)
+        site_title = cleaned or site_title
+        site_year = site_year or parsed_year
     if not site_title:
         client = await _get_client()
         site_title, derived_year = await _title_for(id, media_type, client)
