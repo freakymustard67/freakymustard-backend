@@ -177,68 +177,7 @@ const server = http.createServer((req, res) => {
   });
 });
 
-/* ---------------------------------------------------------------- HLS relay
- *
- * The raw playlists these players hand out are signed with the requesting
- * network (the query carries `asn=`/IP), so they only work from the machine
- * that minted them: the same URL returned 206 here and 403 from anywhere else.
- * The bytes therefore have to be relayed by whoever extracted them.
- *
- * Requests carry an HMAC token rather than the bare URL, so this cannot be
- * used as an open proxy.
- */
-const HLS_SECRET = process.env.SCRAPER_SECRET || 'freaky-scrapers-local-secret';
-
-function signToken(url) {
-  const body = Buffer.from(String(url), 'utf8').toString('base64url');
-  const sig = crypto.createHmac('sha256', HLS_SECRET).update(body).digest('hex').slice(0, 32);
-  return `${body}.${sig}`;
-}
-
-function verifyToken(token) {
-  const i = String(token || '').lastIndexOf('.');
-  if (i <= 0) return null;
-  const body = token.slice(0, i);
-  const sig = token.slice(i + 1);
-  const want = crypto.createHmac('sha256', HLS_SECRET).update(body).digest('hex').slice(0, 32);
-  if (sig.length !== want.length) return null;
-  if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(want))) return null;
-  try {
-    const url = Buffer.from(body, 'base64url').toString('utf8');
-    return /^https?:\/\//i.test(url) ? url : null;
-  } catch {
-    return null;
-  }
-}
-
-const PLAYLIST_TYPES = /application\/(vnd\.apple\.mpegurl|x-mpegurl)|audio\/mpegurl/i;
-
-/** Rewrite a playlist so every variant and segment comes back through here. */
-function rewritePlaylist(text, baseUrl) {
-  const abs = (u) => {
-    try {
-      return new URL(u, baseUrl).toString();
-    } catch {
-      return null;
-    }
-  };
-  return String(text)
-    .split('\n')
-    .map((line) => {
-      const t = line.trim();
-      if (!t) return line;
-      if (t.startsWith('#')) {
-        // #EXT-X-KEY / #EXT-X-MAP / #EXT-X-MEDIA carry URIs too
-        return line.replace(/URI="([^"]+)"/g, (m, u) => {
-          const a = abs(u);
-          return a ? `URI="/api/hls?t=${signToken(a)}"` : m;
-        });
-      }
-      const a = abs(t);
-      return a ? `/api/hls?t=${signToken(a)}` : line;
-    })
-    .join('\n');
-}
+const { verifyToken, relayPathFor, rewritePlaylist, PLAYLIST_TYPES } = require('./lib/hlsrelay');
 
 async function handle(req, res) {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
@@ -385,9 +324,8 @@ async function handle(req, res) {
     const target = url.searchParams.get('url') || '';
     const referer = url.searchParams.get('referer') || '';
     const result = await extractMedia(target, { timeoutMs: 20000, referer });
-    if (result.ok && result.kind === 'hls' && result.mediaUrl) {
-      const ref = referer ? `&ref=${encodeURIComponent(referer)}` : '';
-      result.relayUrl = `/api/hls?t=${signToken(result.mediaUrl)}${ref}`;
+    if (result.ok && result.kind === 'hls' && !result.relayUrl) {
+      result.relayUrl = relayPathFor(result.mediaUrl, referer);
     }
     lastExtract.set(hostOf(target) || target, { ...result, at: Date.now() });
     json(res, result.ok ? 200 : 502, result);

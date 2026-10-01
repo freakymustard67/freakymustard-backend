@@ -25,6 +25,7 @@
 
 const { fetchText } = require('./util');
 const { extractMediaUrls } = require('./unpack');
+const { relayPathFor } = require('./hlsrelay');
 
 /**
  * Host registry. `match` is tested against the embed URL; the first hit wins.
@@ -196,6 +197,10 @@ async function extractMedia(embedUrl, opts = {}) {
         return {
           ok: true,
           ...best,
+          // Minted here, not at the HTTP route: the site driver calls this
+          // function directly, and a token minted only in the route left
+          // emitted stream URLs ending in "undefined".
+          relayUrl: best.kind === 'hls' ? relayPathFor(best.mediaUrl, opts.referer) : undefined,
           host: host.id,
           headers,
           evidence: usedUnpack ? `unpacked packed config at depth ${depth}` : `media url in page at depth ${depth}`,
