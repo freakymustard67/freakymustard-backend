@@ -105,8 +105,11 @@ async function extractNetu(embedUrl, ctx) {
   const page = await fetchText(embedUrl, { timeoutMs: ctx.timeoutMs, headers: ctx.headers });
   if (!page.ok) return { ok: false, error: `netu page: ${page.error}` };
 
-  const direct = pickBest(extractMediaUrls(page.text).urls);
-  if (direct) return { ok: true, ...direct, evidence: 'netu: media url in page' };
+  const scan = extractMediaUrls(page.text);
+  if (!scan.fromCommentsOnly) {
+    const direct = pickBest(scan.urls);
+    if (direct) return { ok: true, ...direct, evidence: 'netu: media url in page' };
+  }
 
   const id =
     (embedUrl.match(/\/e\/([A-Za-z0-9_-]+)/) || [])[1] ||
@@ -165,6 +168,7 @@ async function extractMedia(embedUrl, opts = {}) {
     // shell around an iframe pointing at the real player, so follow one level.
     let current = embedUrl;
     let referer = opts.referer || '';
+    let commentFallback = null;
     for (let depth = 0; depth < 3; depth += 1) {
       // Re-classify at every hop. A wrapper on the movie site is "unknown",
       // but the iframe it points at is a Netu player with its own strategy —
@@ -183,8 +187,8 @@ async function extractMedia(embedUrl, opts = {}) {
       });
       if (!page.ok) return { ok: false, host: host.id, error: `embed page: ${page.error} (${current.slice(0, 60)})` };
 
-      const { urls, usedUnpack, unpacked } = extractMediaUrls(page.text);
-      const best = pickBest(urls);
+      const { urls, usedUnpack, unpacked, fromCommentsOnly } = extractMediaUrls(page.text);
+      const best = fromCommentsOnly ? null : pickBest(urls);
       if (best) {
         return {
           ok: true,
@@ -195,6 +199,8 @@ async function extractMedia(embedUrl, opts = {}) {
           via: current,
         };
       }
+      // Remember a comment-only URL, but keep looking: it is usually a template.
+      if (fromCommentsOnly && !commentFallback) commentFallback = pickBest(urls);
 
       const frames = findIframes(page.text, page.url || current).filter((f) => f !== current);
       if (!frames.length) {
@@ -209,6 +215,16 @@ async function extractMedia(embedUrl, opts = {}) {
       }
       referer = page.url || current;
       current = frames[0];
+    }
+    if (commentFallback) {
+      return {
+        ok: true,
+        ...commentFallback,
+        host: host.id,
+        headers,
+        evidence: 'only a commented-out template URL exists — likely not the real stream',
+        fromCommentsOnly: true,
+      };
     }
     return { ok: false, host: host.id, error: 'followed iframes but never reached a media url' };
   } catch (err) {
