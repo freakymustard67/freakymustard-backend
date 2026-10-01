@@ -166,6 +166,16 @@ async function extractMedia(embedUrl, opts = {}) {
     let current = embedUrl;
     let referer = opts.referer || '';
     for (let depth = 0; depth < 3; depth += 1) {
+      // Re-classify at every hop. A wrapper on the movie site is "unknown",
+      // but the iframe it points at is a Netu player with its own strategy —
+      // scanning that page generically picks up decoy URLs (an old preview
+      // playlist) instead of the real stream.
+      const hopHost = classify(current);
+      if (hopHost.kind === 'netu' && depth > 0) {
+        const res = await extractNetu(current, ctx);
+        if (res.ok) return { ...res, host: hopHost.id, headers, via: current, evidence: `netu at depth ${depth}` };
+        if (depth === 2) return { ...res, host: hopHost.id, headers, via: current };
+      }
       // eslint-disable-next-line no-await-in-loop
       const page = await fetchText(current, {
         timeoutMs,
