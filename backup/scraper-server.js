@@ -56,6 +56,7 @@ try {
 }
 const startedAt = Date.now();
 const lastResult = new Map(); // site name -> { ok, count, ms, error, at }
+const lastExtract = new Map(); // embed host -> last extraction result
 
 /**
  * Is this URL within a site family we already scrape?
@@ -86,6 +87,14 @@ function inFamily(target) {
     )
   )) return true;
   return familyTokens().some((t) => lower.includes(t));
+}
+
+function hostOf(u) {
+  try {
+    return new URL(String(u)).hostname.replace(/^www\./, '');
+  } catch {
+    return '';
+  }
 }
 
 function json(res, code, body) {
@@ -169,6 +178,12 @@ const server = http.createServer(async (req, res) => {
       service: UA_TAG,
       uptimeSec: Math.round((Date.now() - startedAt) / 1000),
       sites: SITES.map((s) => s.name),
+      lastExtract: Object.fromEntries(
+        [...lastExtract.entries()].map(([k, v]) => [
+          k,
+          { ok: v.ok, kind: v.kind || null, host: v.host || null, error: v.error || null },
+        ])
+      ),
       lastResult: Object.fromEntries([...lastResult.entries()])
     });
     return;
@@ -282,6 +297,18 @@ const server = http.createServer(async (req, res) => {
   // Verify a scraped link really is a playable file, from the region that can
   // reach it. Streamed and never read, so a host that ignores Range cannot
   // make us pull a whole film. Restricted to hosts the config already names.
+  // Unwrap an embed page into a raw media URL. Lives here rather than in the
+  // main backend for the same reason the scrapers do: reachability is
+  // region-dependent, and these hosts are ISP-blocked from the dev machine.
+  if (url.pathname === '/api/extract') {
+    const target = url.searchParams.get('url') || '';
+    const referer = url.searchParams.get('referer') || '';
+    const result = await extractMedia(target, { timeoutMs: 20000, referer });
+    lastExtract.set(hostOf(target) || target, { ...result, at: Date.now() });
+    json(res, result.ok ? 200 : 502, result);
+    return;
+  }
+
   if (url.pathname === '/api/probe') {
     const target = url.searchParams.get('url') || '';
     if (!inFamily(target)) {
@@ -328,7 +355,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  json(res, 404, { error: 'not found', endpoints: ['/health', '/api/scrape', '/api/resolve', '/api/inspect', '/api/probe'] });
+  json(res, 404, { error: 'not found', endpoints: ['/health', '/api/scrape', '/api/resolve', '/api/inspect', '/api/probe', '/api/extract'] });
 });
 
 server.listen(PORT, '0.0.0.0', () => {
