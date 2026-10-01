@@ -452,6 +452,7 @@ async function runSite(site, ctx, timeoutMs = 15000) {
   const streams = [];
   const seenUrl = new Set();
   let extracts = 0;
+  const extractTried = [];
   for (const post of posts.slice(0, (site.maxPages || 3))) {
     const links = await crawlForLinks(post.url, search.url || base, {
       linkHosts: site.linkHosts,
@@ -472,6 +473,7 @@ async function runSite(site, ctx, timeoutMs = 15000) {
       // network that minted it.
       if (link.url && EXTRACTABLE.test(link.url) && extracts < MAX_EXTRACTS_PER_SITE) {
         extracts += 1;
+        extractTried.push(link.url.slice(0, 60));
         try {
           // eslint-disable-next-line no-await-in-loop
           const got = await extractMedia(link.url, { timeoutMs: Math.min(timeoutMs, 20000) });
@@ -528,6 +530,8 @@ async function runSite(site, ctx, timeoutMs = 15000) {
     streams,
     ms: Date.now() - started,
     searched,
+    extracted: extracts,
+    extractTried,
     // Which film URLs the search matched. Without this, "found nothing" is
     // indistinguishable from "matched the wrong page" when debugging a driver.
     matched: posts.map((p) => p.url).slice(0, 5),

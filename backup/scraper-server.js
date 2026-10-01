@@ -128,6 +128,8 @@ async function scrapeAll(ctx, perSiteTimeoutMs) {
           error: r.error || null,
           searched: r.searched || null,
           matched: r.matched || null,
+          extracted: r.extracted != null ? r.extracted : null,
+          extractTried: r.extractTried || null,
           at: Date.now()
         });
         return r.streams || [];
