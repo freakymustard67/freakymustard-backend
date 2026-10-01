@@ -29,6 +29,7 @@ const path = require('path');
 const { runSite, isSiteUpstream, findMagnets } = require('./lib/sites');
 const { fetchText } = require('./lib/util');
 const { resolveHost } = require('./lib/resolvers');
+const { extractMedia } = require('./lib/extractors');
 
 const PORT = Number(process.env.PORT || 8080);
 const CONFIG_PATH = process.env.SCRAPERS_CONFIG || path.join(__dirname, 'config', 'scrapers.json');
@@ -159,7 +160,21 @@ async function scrapeAll(ctx, perSiteTimeoutMs) {
   return { streams, ms: Date.now() - started };
 }
 
-const server = http.createServer(async (req, res) => {
+const server = http.createServer((req, res) => {
+  handle(req, res).catch((err) => {
+    // An async handler that throws is an unhandled rejection, which kills the
+    // process - one bad route once crash-looped this whole service. Fail the
+    // request instead.
+    console.error(`[scrapers] unhandled route error: ${err && err.stack ? err.stack : err}`);
+    try {
+      json(res, 500, { error: 'internal error', detail: String((err && err.message) || err).slice(0, 200) });
+    } catch {
+      try { res.destroy(); } catch { /* already gone */ }
+    }
+  });
+});
+
+async function handle(req, res) {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
 
   if (req.method === 'OPTIONS') {
@@ -356,7 +371,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   json(res, 404, { error: 'not found', endpoints: ['/health', '/api/scrape', '/api/resolve', '/api/inspect', '/api/probe', '/api/extract'] });
-});
+}
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`[scrapers] listening on :${PORT}`);
