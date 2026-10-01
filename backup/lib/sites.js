@@ -26,8 +26,18 @@
  */
 
 const { fetchText, isSafeHttpUrl } = require('./util');
+const { extractMedia, classify: classifyEmbed } = require('./extractors');
 
 const DOMAIN_TTL_MS = 30 * 60 * 1000;
+
+// The relay must be reachable by the browser, so emitted HLS urls are absolute.
+const PUBLIC_BASE = (process.env.SCRAPER_PUBLIC_URL || 'https://freakymustard-scrapers.onrender.com').replace(/\/+$/, '');
+
+// Hosts worth spending an extraction attempt on. The packer family is the one
+// that actually yields a raw playlist; the rest are dead in the current
+// rotation and would only burn the site budget.
+const EXTRACTABLE = /streamwish|filelions|streamhg|niramirus|callistanise|morencius|pixibay|hanerix|strwish|vidhide|filemoon|dhcplay|dinisgl/i;
+const MAX_EXTRACTS_PER_SITE = 3;
 /** domain cache: driverKey -> { base, checkedAt, ok } */
 const domainCache = new Map();
 
@@ -441,6 +451,7 @@ async function runSite(site, ctx, timeoutMs = 15000) {
 
   const streams = [];
   const seenUrl = new Set();
+  let extracts = 0;
   for (const post of posts.slice(0, (site.maxPages || 3))) {
     const links = await crawlForLinks(post.url, search.url || base, {
       linkHosts: site.linkHosts,
@@ -454,6 +465,33 @@ async function runSite(site, ctx, timeoutMs = 15000) {
       const dedupe = link.url || `magnet:${link.infoHash}`;
       if (seenUrl.has(dedupe)) continue;
       seenUrl.add(dedupe);
+
+      // An embed page is an ad-laden dead end for a <video> tag. Where we can
+      // unpack the real playlist out of it, emit that instead — relayed
+      // through our own origin, because the CDN signature is bound to the
+      // network that minted it.
+      if (link.url && EXTRACTABLE.test(link.url) && extracts < MAX_EXTRACTS_PER_SITE) {
+        extracts += 1;
+        try {
+          // eslint-disable-next-line no-await-in-loop
+          const got = await extractMedia(link.url, { timeoutMs: Math.min(timeoutMs, 20000) });
+          if (got.ok && got.kind === 'hls' && got.mediaUrl && !got.fromCommentsOnly) {
+            const q = (link.context.match(/\b(2160p|4k|uhd|1080p|720p|480p)\b/i) || [])[1] || '';
+            streams.push({
+              name: `${site.tag || site.name} ${q || 'HLS'} · direct`,
+              title: [link.label, q, 'raw HLS (ads bypassed)'].filter(Boolean).join('\n'),
+              url: `${PUBLIC_BASE}${got.relayUrl}`,
+              quality: q,
+              behaviorHints: { notWebReady: false },
+              _site: site.name,
+              _extracted: true,
+            });
+            continue;
+          }
+        } catch {
+          /* fall through and emit the embed page as before */
+        }
+      }
 
       if (link.infoHash && !link.url) {
         const q =
