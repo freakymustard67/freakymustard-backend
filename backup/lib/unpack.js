@@ -132,6 +132,23 @@ function unpackPacker(source) {
   return results.join('\n');
 }
 
+/**
+ * Blank out JavaScript comments.
+ *
+ * Player pages often keep a commented-out template URL — Netu's page carries
+ * `/* … olplayer.src({src: 'https://<cdn>/…/2018/…mp4.m3u8'}) … *\/` — which is
+ * identical for every film. Scanning raw HTML picks it up and reports a
+ * confident, wrong answer for a title it has nothing to do with.
+ *
+ * `//` is only treated as a comment when it is not preceded by `:`, `'` or `"`
+ * so that `https://` and protocol-relative URLs inside strings survive.
+ */
+function stripJsComments(src) {
+  return String(src || '')
+    .replace(/\/\*[\s\S]*?\*\//g, ' ')
+    .replace(/(^|[^:'"\\])\/\/[^\n]*/g, '$1 ');
+}
+
 /** Media URLs worth looking for in a player config or an unpacked blob. */
 const MEDIA_URL_RE =
   /(?:https?:)?\/\/[^\s"'<>\\)]+?\.(?:m3u8|mp4|m4v|webm|mpd)(?:\?[^\s"'<>\\)]*)?/gi;
@@ -179,17 +196,23 @@ function findMediaUrls(text) {
  * packer blobs and scan again. Returns { urls, usedUnpack }.
  */
 function extractMediaUrls(source) {
-  const direct = findMediaUrls(source);
+  // Live code first: a commented-out template must never outrank real markup.
+  const live = findMediaUrls(stripJsComments(source));
   const unpacked = unpackPacker(source);
-  if (!unpacked) return { urls: direct, usedUnpack: false, unpacked: '' };
   const fromPacked = findMediaUrls(unpacked);
-  const merged = [...direct];
+  const merged = [...live];
   for (const u of fromPacked) if (!merged.includes(u)) merged.push(u);
-  return { urls: merged, usedUnpack: true, unpacked };
+  if (merged.length) return { urls: merged, usedUnpack: Boolean(unpacked), unpacked, fromCommentsOnly: false };
+
+  // Nothing live: fall back to the raw text, so a URL that only exists inside a
+  // comment is still reported — but flagged, because it is often a template.
+  const raw = findMediaUrls(source);
+  return { urls: raw, usedUnpack: Boolean(unpacked), unpacked, fromCommentsOnly: raw.length > 0 };
 }
 
 module.exports = {
   unpackPacker,
+  stripJsComments,
   extractMediaUrls,
   findMediaUrls,
   packerEncode,
