@@ -184,6 +184,18 @@ def _seeds_of(text: str) -> int:
 
 def _classify(url: str, filename: str, blob: str) -> dict:
     """Can a browser <video> play this inline? See the constants above."""
+    # An extracted embed stream, relayed through our own proxy: a real HLS
+    # playlist with the ad-laden player page removed. Nothing about its URL
+    # looks like a media file, so it needs recognising explicitly — otherwise
+    # it is written off as unknown and buried below downloads.
+    if "/api/hls?t=" in (url or ""):
+        return {
+            "container": "hls",
+            "codec": "",
+            "playability": "native",
+            "note": "ad-free HLS (player page bypassed)",
+        }
+
     engine = bool(_ENGINE_URL_RE.search(url or ""))
     container = _container_from(url, filename)
     text = f"{filename or ''} {blob or ''}"
